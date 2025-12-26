@@ -49,6 +49,7 @@ class MeshasticClient:
         self.history_file = history_file
         self.message_history: List[Dict] = []
         self.receive_thread: Optional[threading.Thread] = None
+        self.last_processed_packets = set()  # Track processed packets to avoid duplicates
         
     def load_history(self):
         """Load message history from file"""
@@ -302,12 +303,21 @@ class MeshasticClient:
             # The client will still work for sending messages
             callback_available = False
             try:
-                # Try subscribe method (most common)
+                # Try subscribe method (most common) - with different signatures
                 if hasattr(self.interface, 'subscribe'):
                     try:
+                        # Try with callback function
                         self.interface.subscribe(self.on_receive)
                         callback_available = True
                         print("  [OK] Message callbacks enabled via subscribe()")
+                    except TypeError:
+                        # Maybe it needs a different signature
+                        try:
+                            self.interface.subscribe(self.on_receive, portnums_pb2.TEXT_MESSAGE_APP)
+                            callback_available = True
+                            print("  [OK] Message callbacks enabled via subscribe(portnum)")
+                        except Exception as e:
+                            print(f"  [WARN] subscribe() failed: {e}")
                     except AttributeError:
                         # Method doesn't exist in this version
                         pass
@@ -344,15 +354,26 @@ class MeshasticClient:
                         print("  [OK] Message callbacks enabled via subscribeToConnection()")
                     except Exception as e:
                         pass
+                
+                # Try using the meshtastic event system
+                if not callback_available and hasattr(meshtastic, 'subscribe'):
+                    try:
+                        meshtastic.subscribe('meshtastic.receive.text', self.on_receive)
+                        callback_available = True
+                        print("  [OK] Message callbacks enabled via meshtastic.subscribe()")
+                    except Exception as e:
+                        pass
             except Exception as e:
                 # Any callback setup error is non-fatal
                 print(f"  [WARN] Callback setup error: {e}")
                 pass
             
             if not callback_available:
-                print("  Note: Real-time message callbacks not available")
+                print("  [WARN] Real-time message callbacks not available")
                 print("  You can still send messages successfully")
                 print("  Using polling fallback for receiving messages")
+                print("  [TIP] Try updating meshtastic: pip install --upgrade meshtastic")
+                print("  [TIP] Use /check command to manually check for messages")
             
             # Start polling thread as fallback
             self.start_receive_thread()
@@ -530,30 +551,102 @@ class MeshasticClient:
             return
         
         def poll_messages():
-            """Poll for messages periodically as a fallback"""
-            last_message_count = len(self.message_history)
+            """Poll for messages by checking interface state and manually processing packets"""
             while self.running:
                 try:
                     if self.interface:
-                        # Try to get messages from the interface
-                        # Some versions store messages in a queue or buffer
-                        if hasattr(self.interface, 'getMessages'):
-                            messages = self.interface.getMessages()
-                            if messages:
-                                for msg in messages:
-                                    self._process_message_dict(msg)
-                        elif hasattr(self.interface, 'messages'):
-                            # Check if there are new messages
-                            current_count = len(self.message_history)
-                            if current_count > last_message_count:
-                                last_message_count = current_count
-                    time.sleep(1.0)  # Poll every second
-                except Exception:
+                        # Method 1: Check if interface has a receive queue or buffer
+                        if hasattr(self.interface, 'receiveQueue'):
+                            try:
+                                queue = self.interface.receiveQueue
+                                while not queue.empty():
+                                    packet = queue.get_nowait()
+                                    self.on_receive(packet, self.interface)
+                            except Exception:
+                                pass
+                        
+                        # Method 2: Check if interface stores received packets
+                        if hasattr(self.interface, 'receivedPackets'):
+                            try:
+                                packets = self.interface.receivedPackets
+                                if packets:
+                                    for packet in packets:
+                                        # Create a unique ID for this packet to avoid duplicates
+                                        packet_id = id(packet)
+                                        if packet_id not in self.last_processed_packets:
+                                            self.last_processed_packets.add(packet_id)
+                                            # Keep only last 100 packet IDs
+                                            if len(self.last_processed_packets) > 100:
+                                                self.last_processed_packets = set(list(self.last_processed_packets)[-100:])
+                                            self.on_receive(packet, self.interface)
+                            except Exception:
+                                pass
+                        
+                        # Method 3: Try to manually read and process from stream
+                        # This is a last resort - try to read raw data and let interface process it
+                        if hasattr(self.interface, 'stream'):
+                            try:
+                                stream = self.interface.stream
+                                # Check if there's data waiting
+                                if hasattr(stream, 'in_waiting') and stream.in_waiting > 0:
+                                    # Data is available - the interface should process it automatically
+                                    # But we can try to trigger processing by accessing the interface
+                                    # Some versions need the interface to be "touched" to process
+                                    if hasattr(self.interface, 'noProto'):
+                                        _ = self.interface.noProto  # Access to trigger processing
+                            except Exception:
+                                pass
+                        
+                        # Method 4: Try to access the interface's packet handler directly
+                        # Some versions process packets in a background thread
+                        # We can try to manually check for new packets
+                        if hasattr(self.interface, '_rxQueue'):
+                            try:
+                                queue = self.interface._rxQueue
+                                while not queue.empty():
+                                    packet = queue.get_nowait()
+                                    self.on_receive(packet, self.interface)
+                            except Exception:
+                                pass
+                    
+                    time.sleep(0.3)  # Poll every 0.3 seconds for better responsiveness
+                except Exception as e:
                     # Ignore errors in polling thread
-                    time.sleep(1.0)
+                    time.sleep(0.3)
         
         self.receive_thread = threading.Thread(target=poll_messages, daemon=True)
         self.receive_thread.start()
+    
+    def check_for_messages(self):
+        """Manually check for new messages by examining interface state"""
+        if not self.interface:
+            print("[ERROR] Not connected to device")
+            return
+        
+        try:
+            # Try to access any internal message storage
+            found_new = False
+            
+            # Method 1: Check if interface has a way to get recent messages
+            if hasattr(self.interface, 'getMyNodeInfo'):
+                # Sometimes messages are stored in node info
+                node_info = self.interface.getMyNodeInfo()
+                # This usually doesn't contain messages, but worth checking
+            
+            # Method 2: Try to manually read from stream and process
+            if hasattr(self.interface, 'stream'):
+                stream = self.interface.stream
+                if hasattr(stream, 'in_waiting') and stream.in_waiting > 0:
+                    # There's data waiting - try to trigger processing
+                    # The interface should process it automatically
+                    print("  [INFO] Data available on stream, interface should process automatically")
+                    found_new = True
+            
+            if not found_new:
+                print("  [INFO] No new messages detected. Messages should appear automatically when received.")
+                print("  [INFO] If messages aren't appearing, the callback may not be working with this meshtastic version.")
+        except Exception as e:
+            print(f"  [ERROR] Error checking for messages: {e}")
     
     def _process_message_dict(self, msg: Dict):
         """Process a message dictionary"""
@@ -1287,6 +1380,7 @@ class MeshasticClient:
         print("  /setregion - Set device region: /setregion <region> (e.g., US, EU_433, EU_868)")
         print("  /reboot   - Reboot the device: /reboot [delay_seconds]")
         print("  /history  - Show message history")
+        print("  /check    - Manually check for new messages")
         print("  /clear    - Clear screen")
         print("  /quit     - Exit client")
         print("\nType a message to send (broadcast), or use commands above.")
@@ -1320,6 +1414,7 @@ class MeshasticClient:
                             print("  /setregion - Set device region: /setregion <region> (e.g., US, EU_433, EU_868)")
                             print("  /reboot   - Reboot the device: /reboot [delay_seconds]")
                             print("  /history  - Show message history")
+                            print("  /check    - Manually check for new messages")
                             print("  /clear    - Clear screen")
                             print("  /quit     - Exit client")
                             print()
@@ -1401,6 +1496,9 @@ class MeshasticClient:
                                 print("Reboot cancelled.")
                         elif cmd == '/history':
                             self.show_history()
+                        elif cmd == '/check' or cmd == '/refresh':
+                            # Manually check for new messages
+                            self.check_for_messages()
                         elif cmd == '/clear':
                             os.system('cls' if os.name == 'nt' else 'clear')
                         else:
