@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Optional, List, Dict
 import json
 import os
+import fnmatch
 
 try:
     import meshtastic
@@ -476,8 +477,24 @@ class MeshasticClient:
         
         try:
             if destination_id:
-                # Private message - no confirmation needed
-                self.interface.sendText(text, destinationId=destination_id)
+                # Private message - use wantAck=True to ensure delivery
+                # Try different API formats for compatibility
+                try:
+                    # Try with wantAck parameter (recommended for private messages)
+                    self.interface.sendText(text, destinationId=destination_id, wantAck=True)
+                except TypeError:
+                    # Fallback if wantAck is not supported
+                    try:
+                        self.interface.sendText(text, destinationId=destination_id)
+                    except Exception as e:
+                        # Try alternative API format
+                        if hasattr(self.interface, 'sendData'):
+                            # Some versions use sendData for private messages
+                            from meshtastic import portnums_pb2
+                            self.interface.sendData(text.encode('utf-8'), destinationId=destination_id, wantAck=True, portNum=portnums_pb2.TEXT_MESSAGE_APP)
+                        else:
+                            raise e
+                
                 # Try to get node name for display
                 node_name = f"Node {destination_id}"
                 nodes = self.get_node_info()
@@ -617,23 +634,183 @@ class MeshasticClient:
         else:
             print(f"{indent_str}{prefix}{data}")
     
-    def show_nodes(self):
-        """Display connected nodes with all available information"""
+    def resolve_node_name(self, pattern: str) -> List[tuple]:
+        """Resolve node names (with wildcards) to node IDs
+        
+        Args:
+            pattern: Name pattern with wildcards (e.g., '*my_node*', 'test*', '*device')
+        
+        Returns:
+            List of tuples (node_id, long_name, short_name) for matching nodes
+        """
+        nodes = self.get_node_info()
+        if not nodes:
+            return []
+        
+        matches = []
+        for node_id, node in nodes.items():
+            num = node.get('num', node_id)
+            user = node.get('user', {})
+            long_name = user.get('longName', '')
+            short_name = user.get('shortName', '')
+            
+            # Match against both long name and short name (case-insensitive)
+            pattern_lower = pattern.lower()
+            long_name_lower = long_name.lower() if long_name else ''
+            short_name_lower = short_name.lower() if short_name else ''
+            
+            if (fnmatch.fnmatch(long_name_lower, pattern_lower) or 
+                fnmatch.fnmatch(short_name_lower, pattern_lower) or
+                fnmatch.fnmatch(str(num), pattern)):
+                matches.append((num, long_name, short_name))
+        
+        return matches
+    
+    def show_resolve(self, pattern: str):
+        """Display node IDs that match the given name pattern"""
+        if not pattern:
+            print("Usage: /resolve <pattern>")
+            print("Example: /resolve *my_node*")
+            print("Example: /resolve test*")
+            print("Example: /resolve *device")
+            return
+        
+        matches = self.resolve_node_name(pattern)
+        if not matches:
+            print(f"No nodes found matching pattern: {pattern}")
+            return
+        
+        # Get current device node ID
+        my_node_id = self.get_my_node_id()
+        
+        print(f"\n=== Nodes matching '{pattern}' ===")
+        for node_id, long_name, short_name in matches:
+            name_display = long_name if long_name else short_name
+            if not name_display:
+                name_display = f"Node {node_id}"
+            
+            # Check if this is the current device
+            is_current = (my_node_id is not None and str(node_id) == str(my_node_id))
+            current_marker = " [CURRENT DEVICE]" if is_current else ""
+            
+            print(f"  Node ID: {node_id} - {name_display} ({short_name if short_name else 'N/A'}){current_marker}")
+        print()
+    
+    def get_hop_count(self, node: Dict) -> Optional[int]:
+        """Extract hop count from node data
+        
+        Returns:
+            Hop count if available, None otherwise
+        """
+        # Try various possible fields for hop information
+        # hopLimit is the maximum hops, but we want actual hops away
+        if 'hopLimit' in node:
+            # hopLimit might be the actual hops away in some versions
+            hop_limit = node.get('hopLimit')
+            if hop_limit is not None:
+                return hop_limit
+        
+        # Check for hopsAway field
+        if 'hopsAway' in node:
+            hops_away = node.get('hopsAway')
+            if hops_away is not None:
+                return hops_away
+        
+        # Check in position data
+        position = node.get('position', {})
+        if isinstance(position, dict):
+            if 'hopsAway' in position:
+                return position.get('hopsAway')
+        
+        # Check for hopStart (sometimes used to indicate distance)
+        if 'hopStart' in node:
+            hop_start = node.get('hopStart')
+            if hop_start is not None:
+                return hop_start
+        
+        # Check in route information
+        route = node.get('route', {})
+        if isinstance(route, dict):
+            if 'hops' in route:
+                return route.get('hops')
+        
+        return None
+    
+    def get_my_node_id(self) -> Optional[int]:
+        """Get the current device's node ID"""
+        if not self.interface:
+            return None
+        try:
+            node_info = self.interface.getMyNodeInfo()
+            return node_info.get('num')
+        except Exception:
+            return None
+    
+    def show_nodes(self, pattern: Optional[str] = None):
+        """Display connected nodes with all available information
+        
+        Args:
+            pattern: Optional wildcard pattern to filter nodes (e.g., '*my_node*')
+        """
         nodes = self.get_node_info()
         if not nodes:
             print("No node information available")
             return
         
-        print("\n=== Connected Nodes (All Information) ===")
+        # Get current device node ID
+        my_node_id = self.get_my_node_id()
+        
+        # Filter nodes by pattern if provided
+        filtered_nodes = {}
+        if pattern:
+            pattern_lower = pattern.lower()
+            for node_id, node in nodes.items():
+                num = node.get('num', node_id)
+                user = node.get('user', {})
+                long_name = user.get('longName', '')
+                short_name = user.get('shortName', '')
+                
+                long_name_lower = long_name.lower() if long_name else ''
+                short_name_lower = short_name.lower() if short_name else ''
+                
+                if (fnmatch.fnmatch(long_name_lower, pattern_lower) or 
+                    fnmatch.fnmatch(short_name_lower, pattern_lower) or
+                    fnmatch.fnmatch(str(num), pattern)):
+                    filtered_nodes[node_id] = node
+            nodes = filtered_nodes
+        
+        if not nodes:
+            if pattern:
+                print(f"\nNo nodes found matching pattern: {pattern}")
+            else:
+                print("No node information available")
+            return
+        
+        title = "=== Connected Nodes"
+        if pattern:
+            title += f" (filtered: '{pattern}')"
+        title += " ==="
+        print(f"\n{title}")
         print("  (Use /pm <node_id> <message> to send private message)")
         print()
+        
         for node_id, node in nodes.items():
             num = node.get('num', node_id)
             user = node.get('user', {})
             long_name = user.get('longName', 'Unknown')
             short_name = user.get('shortName', 'Unknown')
             
-            print(f"--- Node ID: {num} ({long_name} / {short_name}) ---")
+            # Check if this is the current device
+            is_current = (my_node_id is not None and str(num) == str(my_node_id))
+            current_marker = " [CURRENT DEVICE]" if is_current else ""
+            
+            # Get hop count
+            hop_count = self.get_hop_count(node)
+            hop_info = ""
+            if hop_count is not None:
+                hop_info = f" [{hop_count} hop{'s' if hop_count != 1 else ''} away]"
+            
+            print(f"--- Node ID: {num} ({long_name} / {short_name}){current_marker}{hop_info} ---")
             print()
             
             # Print all available node information
@@ -696,8 +873,9 @@ class MeshasticClient:
         print("Commands:")
         print("  /help     - Show this help")
         print("  /status   - Show device status")
-        print("  /nodes    - List connected nodes")
+        print("  /nodes    - List connected nodes: /nodes [pattern] (supports wildcards)")
         print("  /pm       - Send private message: /pm <node_id> <message>")
+        print("  /resolve  - Resolve name to node ID: /resolve <pattern> (supports wildcards)")
         print("  /setname  - Set node name: /setname <long_name> <short_name>")
         print("  /reboot   - Reboot the device: /reboot [delay_seconds]")
         print("  /history  - Show message history")
@@ -705,6 +883,7 @@ class MeshasticClient:
         print("  /quit     - Exit client")
         print("\nType a message to send (broadcast), or use commands above.")
         print("Use /pm <node_id> <message> to send a private message.")
+        print("Use /resolve <pattern> to find node IDs by name (e.g., /resolve *my_node*).")
         print("Use /setname <long_name> <short_name> to change your node name.")
         print("Use /reboot [delay] to reboot the device (default: 10 seconds).\n")
         
@@ -725,8 +904,9 @@ class MeshasticClient:
                             print("\nCommands:")
                             print("  /help     - Show this help")
                             print("  /status   - Show device status")
-                            print("  /nodes    - List connected nodes")
+                            print("  /nodes    - List connected nodes: /nodes [pattern] (supports wildcards)")
                             print("  /pm       - Send private message: /pm <node_id> <message>")
+                            print("  /resolve  - Resolve name to node ID: /resolve <pattern> (supports wildcards)")
                             print("  /setname  - Set node name: /setname <long_name> <short_name>")
                             print("  /reboot   - Reboot the device: /reboot [delay_seconds]")
                             print("  /history  - Show message history")
@@ -735,8 +915,11 @@ class MeshasticClient:
                             print()
                         elif cmd == '/status':
                             self.show_status()
-                        elif cmd == '/nodes':
-                            self.show_nodes()
+                        elif cmd.startswith('/nodes'):
+                            # Parse nodes command: /nodes [pattern]
+                            parts = user_input.split(' ', 1)
+                            pattern = parts[1] if len(parts) > 1 else None
+                            self.show_nodes(pattern=pattern)
                         elif cmd.startswith('/pm ') or cmd.startswith('/private '):
                             # Parse private message command: /pm <node_id> <message>
                             parts = user_input.split(' ', 2)
@@ -744,10 +927,23 @@ class MeshasticClient:
                                 print("Usage: /pm <node_id> <message>")
                                 print("Example: /pm 1234567890 Hello there!")
                                 print("Use /nodes to see available node IDs")
+                                print("Use /resolve <pattern> to find node IDs by name")
                             else:
                                 node_id = parts[1]
                                 message = parts[2]
                                 self.send_private_message(node_id, message)
+                        elif cmd.startswith('/resolve '):
+                            # Parse resolve command: /resolve <pattern>
+                            parts = user_input.split(' ', 1)
+                            if len(parts) < 2:
+                                print("Usage: /resolve <pattern>")
+                                print("Example: /resolve *my_node*")
+                                print("Example: /resolve test*")
+                                print("Example: /resolve *device")
+                                print("Supports wildcards: * matches any characters")
+                            else:
+                                pattern = parts[1]
+                                self.show_resolve(pattern)
                         elif cmd.startswith('/setname '):
                             # Parse setname command: /setname <long_name> <short_name>
                             parts = user_input.split(' ', 2)
@@ -820,26 +1016,11 @@ Examples:
   %(prog)s                    # Interactive mode with auto-detected serial device
   %(prog)s -p COM3            # Connect to device on COM3 (Windows)
   %(prog)s -p /dev/ttyUSB0    # Connect to device on /dev/ttyUSB0 (Linux)
-  %(prog)s -s "Hello World"   # Send a broadcast message via serial and exit
-  %(prog)s --pm 1234567890 "Hi!"  # Send a private message to node 1234567890
-  %(prog)s --setname "My Device" "MD"  # Set node name
-  %(prog)s --reboot 5          # Reboot device in 5 seconds
-  %(prog)s --status           # Show device status and exit
   %(prog)s --list-ports       # List available serial ports
         """
     )
     
     parser.add_argument('-p', '--port', help='Serial port (e.g., COM3 or /dev/ttyUSB0)')
-    parser.add_argument('-s', '--send', help='Send a broadcast message and exit')
-    parser.add_argument('--pm', nargs=2, metavar=('NODE_ID', 'MESSAGE'), 
-                       help='Send a private message: --pm <node_id> <message>')
-    parser.add_argument('--setname', nargs=2, metavar=('LONG_NAME', 'SHORT_NAME'),
-                       help='Set node name: --setname <long_name> <short_name>')
-    parser.add_argument('--reboot', type=int, metavar='DELAY', nargs='?', const=10,
-                       help='Reboot the device: --reboot [delay_seconds] (default: 10)')
-    parser.add_argument('--status', action='store_true', help='Show device status and exit')
-    parser.add_argument('--nodes', action='store_true', help='List connected nodes and exit')
-    parser.add_argument('--history', action='store_true', help='Show message history and exit')
     parser.add_argument('--list-ports', action='store_true', help='List available serial ports and exit')
     parser.add_argument('--history-file', default='meshastic_history.json', 
                        help='File to store message history (default: meshastic_history.json)')
@@ -853,36 +1034,8 @@ Examples:
         client.list_serial_ports()
         sys.exit(0)
     
-    # Handle non-interactive commands
-    if args.status or args.nodes or args.history or args.send or args.pm or args.setname or args.reboot is not None:
-        if not client.connect():
-            sys.exit(1)
-        
-        client.load_history()
-        
-        if args.status:
-            client.show_status()
-        elif args.nodes:
-            client.show_nodes()
-        elif args.history:
-            client.show_history()
-        elif args.pm:
-            node_id, message = args.pm
-            client.send_private_message(node_id, message)
-        elif args.setname:
-            long_name, short_name = args.setname
-            client.set_node_name(long_name, short_name)
-        elif args.reboot is not None:
-            delay = args.reboot if args.reboot > 0 else 10
-            client.reboot_device(delay)
-        elif args.send:
-            # Command-line send - skip confirmation for automation
-            client.send_message(args.send, skip_confirmation=True)
-        
-        client.disconnect()
-    else:
-        # Interactive mode
-        client.interactive_mode()
+    # Interactive mode
+    client.interactive_mode()
 
 
 if __name__ == '__main__':
