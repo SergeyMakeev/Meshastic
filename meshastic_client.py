@@ -302,37 +302,60 @@ class MeshasticClient:
             # The client will still work for sending messages
             callback_available = False
             try:
+                # Try subscribe method (most common)
                 if hasattr(self.interface, 'subscribe'):
                     try:
                         self.interface.subscribe(self.on_receive)
                         callback_available = True
+                        print("  [OK] Message callbacks enabled via subscribe()")
                     except AttributeError:
                         # Method doesn't exist in this version
                         pass
-                    except Exception:
+                    except Exception as e:
                         # Some other error, but connection is still good
+                        print(f"  [WARN] subscribe() failed: {e}")
                         pass
                 
+                # Try setOnReceive method
                 if not callback_available and hasattr(self.interface, 'setOnReceive'):
                     try:
                         self.interface.setOnReceive(self.on_receive)
                         callback_available = True
-                    except:
+                        print("  [OK] Message callbacks enabled via setOnReceive()")
+                    except Exception as e:
+                        print(f"  [WARN] setOnReceive() failed: {e}")
                         pass
                 
+                # Try direct assignment
                 if not callback_available and hasattr(self.interface, 'onReceive'):
                     try:
                         self.interface.onReceive = self.on_receive
                         callback_available = True
-                    except:
+                        print("  [OK] Message callbacks enabled via onReceive assignment")
+                    except Exception as e:
+                        print(f"  [WARN] onReceive assignment failed: {e}")
                         pass
-            except Exception:
+                
+                # Try subscribeToConnection method (some versions)
+                if not callback_available and hasattr(self.interface, 'subscribeToConnection'):
+                    try:
+                        self.interface.subscribeToConnection(self.on_receive)
+                        callback_available = True
+                        print("  [OK] Message callbacks enabled via subscribeToConnection()")
+                    except Exception as e:
+                        pass
+            except Exception as e:
                 # Any callback setup error is non-fatal
+                print(f"  [WARN] Callback setup error: {e}")
                 pass
             
             if not callback_available:
                 print("  Note: Real-time message callbacks not available")
                 print("  You can still send messages successfully")
+                print("  Using polling fallback for receiving messages")
+            
+            # Start polling thread as fallback
+            self.start_receive_thread()
             
             self.running = True
             return True
@@ -401,9 +424,26 @@ class MeshasticClient:
             
             return False
     
-    def on_receive(self, packet, interface):
-        """Callback for received messages"""
+    def on_receive(self, *args, **kwargs):
+        """Callback for received messages - handles different signatures"""
         try:
+            # Handle different callback signatures
+            packet = None
+            interface = None
+            
+            if args:
+                packet = args[0]
+                if len(args) > 1:
+                    interface = args[1]
+            
+            if 'packet' in kwargs:
+                packet = kwargs['packet']
+            if 'interface' in kwargs:
+                interface = kwargs['interface']
+            
+            if not packet:
+                return
+            
             # Handle different packet formats
             decoded = None
             if isinstance(packet, dict):
@@ -455,19 +495,103 @@ class MeshasticClient:
                             'text': text
                         }
                         
-                        self.add_to_history(message)
-                        
-                        # Display message
-                        print(f"\n[{timestamp}] {from_name} ({from_id}): {text}")
-                        print("> ", end='', flush=True)
+                        # Check if we've already seen this message (avoid duplicates)
+                        if not self._is_duplicate_message(message):
+                            self.add_to_history(message)
+                            
+                            # Display message
+                            print(f"\n[{timestamp}] {from_name} ({from_id}): {text}")
+                            print("> ", end='', flush=True)
         except Exception as e:
             # Silently handle errors to avoid disrupting the interface
+            # Uncomment for debugging:
+            # import traceback
+            # print(f"\n[DEBUG] Error in on_receive: {e}")
+            # print(f"[DEBUG] Packet type: {type(packet)}")
+            # traceback.print_exc()
             pass
     
+    def _is_duplicate_message(self, message: Dict) -> bool:
+        """Check if we've already seen this message"""
+        if not self.message_history:
+            return False
+        
+        # Check last 10 messages for duplicates
+        for existing in self.message_history[-10:]:
+            if (existing.get('text') == message.get('text') and
+                existing.get('from_id') == message.get('from_id') and
+                existing.get('timestamp') == message.get('timestamp')):
+                return True
+        return False
+    
     def start_receive_thread(self):
-        """Start background thread for receiving messages"""
-        # The subscribe callback handles receiving, so we just need to keep the interface alive
-        pass
+        """Start background thread for receiving messages via polling"""
+        if self.receive_thread and self.receive_thread.is_alive():
+            return
+        
+        def poll_messages():
+            """Poll for messages periodically as a fallback"""
+            last_message_count = len(self.message_history)
+            while self.running:
+                try:
+                    if self.interface:
+                        # Try to get messages from the interface
+                        # Some versions store messages in a queue or buffer
+                        if hasattr(self.interface, 'getMessages'):
+                            messages = self.interface.getMessages()
+                            if messages:
+                                for msg in messages:
+                                    self._process_message_dict(msg)
+                        elif hasattr(self.interface, 'messages'):
+                            # Check if there are new messages
+                            current_count = len(self.message_history)
+                            if current_count > last_message_count:
+                                last_message_count = current_count
+                    time.sleep(1.0)  # Poll every second
+                except Exception:
+                    # Ignore errors in polling thread
+                    time.sleep(1.0)
+        
+        self.receive_thread = threading.Thread(target=poll_messages, daemon=True)
+        self.receive_thread.start()
+    
+    def _process_message_dict(self, msg: Dict):
+        """Process a message dictionary"""
+        try:
+            text = msg.get('text', '')
+            if not text:
+                return
+            
+            from_id = msg.get('fromId', msg.get('from', 'Unknown'))
+            from_name = 'Unknown'
+            
+            # Try to get sender name from nodes
+            if self.interface and hasattr(self.interface, 'nodes'):
+                nodes = self.interface.nodes
+                if from_id in nodes:
+                    user = nodes[from_id].get('user', {})
+                    from_name = user.get('longName', user.get('shortName', str(from_id)))
+                else:
+                    from_name = str(from_id)
+            
+            timestamp = datetime.now().isoformat()
+            
+            message = {
+                'timestamp': timestamp,
+                'from_id': str(from_id),
+                'from_name': from_name,
+                'text': text
+            }
+            
+            # Check if we've already seen this message
+            if not self._is_duplicate_message(message):
+                self.add_to_history(message)
+                
+                # Display message
+                print(f"\n[{timestamp}] {from_name} ({from_id}): {text}")
+                print("> ", end='', flush=True)
+        except Exception:
+            pass
     
     def send_message(self, text: str, destination_id: Optional[int] = None, skip_confirmation: bool = False) -> bool:
         """Send a text message (broadcast or private)"""
@@ -837,6 +961,282 @@ class MeshasticClient:
                 print(f"[{timestamp}] {from_name}: {text}")
         print()
     
+    def get_region(self) -> Optional[str]:
+        """Get the current device region
+        
+        Returns:
+            Region name as string if available, None otherwise
+        """
+        if not self.interface:
+            return None
+        
+        try:
+            # Method 1: Try using getPref (most common method)
+            if hasattr(self.interface, 'getPref'):
+                try:
+                    region = self.interface.getPref('lora.region')
+                    if region is not None:
+                        region_names = {
+                            0: "UNSET",
+                            1: "US",
+                            2: "EU_433",
+                            3: "EU_868",
+                            4: "CN",
+                            5: "JP",
+                            6: "ANZ",
+                            7: "KR",
+                            8: "TW",
+                            9: "RU",
+                            10: "IN",
+                            11: "NZ_865",
+                            12: "TH",
+                            13: "LORA_24",
+                            14: "UA_433",
+                            15: "UA_868",
+                            16: "MY_433",
+                            17: "MY_919",
+                            18: "SG_923",
+                        }
+                        return region_names.get(region, f"UNKNOWN({region})")
+                except Exception:
+                    pass
+            
+            # Method 2: Try using localNode.getPref
+            if hasattr(self.interface, 'localNode'):
+                local_node = self.interface.localNode
+                if hasattr(local_node, 'getPref'):
+                    try:
+                        region = local_node.getPref('lora.region')
+                        if region is not None:
+                            region_names = {
+                                0: "UNSET",
+                                1: "US",
+                                2: "EU_433",
+                                3: "EU_868",
+                                4: "CN",
+                                5: "JP",
+                                6: "ANZ",
+                                7: "KR",
+                                8: "TW",
+                                9: "RU",
+                                10: "IN",
+                                11: "NZ_865",
+                                12: "TH",
+                                13: "LORA_24",
+                                14: "UA_433",
+                                15: "UA_868",
+                                16: "MY_433",
+                                17: "MY_919",
+                                18: "SG_923",
+                            }
+                            return region_names.get(region, f"UNKNOWN({region})")
+                    except Exception:
+                        pass
+            
+            # Method 3: Try to get region from radio config
+            if hasattr(self.interface, 'radioConfig'):
+                radio_config = self.interface.radioConfig
+                if hasattr(radio_config, 'preferences'):
+                    prefs = radio_config.preferences
+                    if hasattr(prefs, 'lora') and hasattr(prefs.lora, 'region'):
+                        region = prefs.lora.region
+                        # Convert region enum to string
+                        if region is not None:
+                            region_names = {
+                                0: "UNSET",
+                                1: "US",
+                                2: "EU_433",
+                                3: "EU_868",
+                                4: "CN",
+                                5: "JP",
+                                6: "ANZ",
+                                7: "KR",
+                                8: "TW",
+                                9: "RU",
+                                10: "IN",
+                                11: "NZ_865",
+                                12: "TH",
+                                13: "LORA_24",
+                                14: "UA_433",
+                                15: "UA_868",
+                                16: "MY_433",
+                                17: "MY_919",
+                                18: "SG_923",
+                            }
+                            return region_names.get(region, f"UNKNOWN({region})")
+            
+            # Method 4: Try alternative method - check in node info
+            node_info = self.interface.getMyNodeInfo()
+            radio = node_info.get('radio', {})
+            if isinstance(radio, dict) and 'region' in radio:
+                region = radio.get('region')
+                if region is not None:
+                    region_names = {
+                        0: "UNSET",
+                        1: "US",
+                        2: "EU_433",
+                        3: "EU_868",
+                        4: "CN",
+                        5: "JP",
+                        6: "ANZ",
+                        7: "KR",
+                        8: "TW",
+                        9: "RU",
+                        10: "IN",
+                        11: "NZ_865",
+                        12: "TH",
+                        13: "LORA_24",
+                        14: "UA_433",
+                        15: "UA_868",
+                        16: "MY_433",
+                        17: "MY_919",
+                        18: "SG_923",
+                    }
+                    return region_names.get(region, f"UNKNOWN({region})")
+            
+            return None
+        except Exception:
+            return None
+    
+    def set_region(self, region_name: str) -> bool:
+        """Set the device region
+        
+        Args:
+            region_name: Region name (e.g., 'US', 'EU_433', 'EU_868', 'CN', 'JP', etc.)
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.interface:
+            print("[ERROR] Not connected to device")
+            return False
+        
+        # Map region names to enum values
+        region_map = {
+            'UNSET': 0,
+            'US': 1,
+            'EU_433': 2,
+            'EU_868': 3,
+            'CN': 4,
+            'JP': 5,
+            'ANZ': 6,
+            'KR': 7,
+            'TW': 8,
+            'RU': 9,
+            'IN': 10,
+            'NZ_865': 11,
+            'TH': 12,
+            'LORA_24': 13,
+            'UA_433': 14,
+            'UA_868': 15,
+            'MY_433': 16,
+            'MY_919': 17,
+            'SG_923': 18,
+        }
+        
+        region_upper = region_name.upper()
+        if region_upper not in region_map:
+            print(f"[ERROR] Invalid region: {region_name}")
+            print("  Valid regions: US, EU_433, EU_868, CN, JP, ANZ, KR, TW, RU, IN, NZ_865, TH, LORA_24, UA_433, UA_868, MY_433, MY_919, SG_923")
+            return False
+        
+        try:
+            region_value = region_map[region_upper]
+            
+            # Method 1: Try using set (CLI method) - accepts string or numeric value
+            if hasattr(self.interface, 'set'):
+                try:
+                    # Try with string first (as CLI does)
+                    self.interface.set('lora.region', region_upper)
+                    print(f"[OK] Region set to: {region_name}")
+                    print("  Note: Device may need to reboot for changes to take full effect")
+                    return True
+                except Exception:
+                    try:
+                        # Fallback to numeric value
+                        self.interface.set('lora.region', region_value)
+                        print(f"[OK] Region set to: {region_name}")
+                        print("  Note: Device may need to reboot for changes to take full effect")
+                        return True
+                    except Exception:
+                        pass
+            
+            # Method 2: Try using setPref (most common method)
+            if hasattr(self.interface, 'setPref'):
+                try:
+                    self.interface.setPref('lora.region', region_value)
+                    print(f"[OK] Region set to: {region_name}")
+                    print("  Note: Device may need to reboot for changes to take full effect")
+                    return True
+                except Exception as e:
+                    # If setPref doesn't work, try other methods
+                    pass
+            
+            # Method 3: Try using localNode.setPref
+            if hasattr(self.interface, 'localNode'):
+                local_node = self.interface.localNode
+                if hasattr(local_node, 'setPref'):
+                    try:
+                        local_node.setPref('lora.region', region_value)
+                        print(f"[OK] Region set to: {region_name}")
+                        print("  Note: Device may need to reboot for changes to take full effect")
+                        return True
+                    except Exception as e:
+                        pass
+            
+            # Method 4: Try using setRadioConfig with localNode
+            if hasattr(self.interface, 'localNode'):
+                local_node = self.interface.localNode
+                if hasattr(local_node, 'setRadioConfig'):
+                    try:
+                        from meshtastic import mesh_pb2
+                        config = mesh_pb2.Config()
+                        config.lora.region = region_value
+                        local_node.setRadioConfig(config)
+                        print(f"[OK] Region set to: {region_name}")
+                        print("  Note: Device may need to reboot for changes to take full effect")
+                        return True
+                    except Exception as e:
+                        pass
+            
+            # Method 5: Try to set region via radio config
+            if hasattr(self.interface, 'radioConfig'):
+                radio_config = self.interface.radioConfig
+                if hasattr(radio_config, 'preferences'):
+                    prefs = radio_config.preferences
+                    if hasattr(prefs, 'lora'):
+                        if hasattr(prefs.lora, 'region'):
+                            prefs.lora.region = region_value
+                            
+                            # Write the configuration
+                            if hasattr(self.interface, 'writeConfig'):
+                                try:
+                                    self.interface.writeConfig()
+                                    print(f"[OK] Region set to: {region_name}")
+                                    print("  Note: Device may need to reboot for changes to take full effect")
+                                    return True
+                                except Exception as e:
+                                    pass
+                            elif hasattr(self.interface, 'localNode') and hasattr(self.interface.localNode, 'writeConfig'):
+                                try:
+                                    self.interface.localNode.writeConfig()
+                                    print(f"[OK] Region set to: {region_name}")
+                                    print("  Note: Device may need to reboot for changes to take full effect")
+                                    return True
+                                except Exception as e:
+                                    pass
+            
+            # If all methods failed
+            print("[ERROR] Cannot set region - API not available in this meshtastic version")
+            print("  Tried methods: set, setPref, localNode.setPref, setRadioConfig, writeConfig")
+            print("  You may need to update the meshtastic library: pip install --upgrade meshtastic")
+            print("  Or use the meshtastic CLI: meshtastic --set lora.region US")
+            return False
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to set region: {e}")
+            return False
+    
     def show_status(self):
         """Display device status"""
         if not self.interface:
@@ -853,6 +1253,13 @@ class MeshasticClient:
             user = node_info.get('user', {})
             print(f"Long Name: {user.get('longName', 'Unknown')}")
             print(f"Short Name: {user.get('shortName', 'Unknown')}")
+            
+            # Get and display region
+            region = self.get_region()
+            if region:
+                print(f"Region: {region}")
+            else:
+                print("Region: Not set or unavailable")
             
             # Get radio config
             radio = node_info.get('radio', {})
@@ -877,6 +1284,7 @@ class MeshasticClient:
         print("  /pm       - Send private message: /pm <node_id> <message>")
         print("  /resolve  - Resolve name to node ID: /resolve <pattern> (supports wildcards)")
         print("  /setname  - Set node name: /setname <long_name> <short_name>")
+        print("  /setregion - Set device region: /setregion <region> (e.g., US, EU_433, EU_868)")
         print("  /reboot   - Reboot the device: /reboot [delay_seconds]")
         print("  /history  - Show message history")
         print("  /clear    - Clear screen")
@@ -885,6 +1293,7 @@ class MeshasticClient:
         print("Use /pm <node_id> <message> to send a private message.")
         print("Use /resolve <pattern> to find node IDs by name (e.g., /resolve *my_node*).")
         print("Use /setname <long_name> <short_name> to change your node name.")
+        print("Use /setregion <region> to set device region (e.g., /setregion US).")
         print("Use /reboot [delay] to reboot the device (default: 10 seconds).\n")
         
         try:
@@ -908,6 +1317,7 @@ class MeshasticClient:
                             print("  /pm       - Send private message: /pm <node_id> <message>")
                             print("  /resolve  - Resolve name to node ID: /resolve <pattern> (supports wildcards)")
                             print("  /setname  - Set node name: /setname <long_name> <short_name>")
+                            print("  /setregion - Set device region: /setregion <region> (e.g., US, EU_433, EU_868)")
                             print("  /reboot   - Reboot the device: /reboot [delay_seconds]")
                             print("  /history  - Show message history")
                             print("  /clear    - Clear screen")
@@ -955,6 +1365,17 @@ class MeshasticClient:
                                 long_name = parts[1]
                                 short_name = parts[2]
                                 self.set_node_name(long_name, short_name)
+                        elif cmd.startswith('/setregion '):
+                            # Parse setregion command: /setregion <region>
+                            parts = user_input.split(' ', 1)
+                            if len(parts) < 2:
+                                print("Usage: /setregion <region>")
+                                print("Example: /setregion US")
+                                print("Example: /setregion EU_433")
+                                print("Valid regions: US, EU_433, EU_868, CN, JP, ANZ, KR, TW, RU, IN, NZ_865, TH, LORA_24, UA_433, UA_868, MY_433, MY_919, SG_923")
+                            else:
+                                region = parts[1]
+                                self.set_region(region)
                         elif cmd.startswith('/reboot'):
                             # Parse reboot command: /reboot [delay_seconds]
                             parts = user_input.split()
