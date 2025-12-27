@@ -1319,18 +1319,15 @@ class MeshasticClient:
                                 node_identifier = parts[1]
                                 message = parts[2]
                                 self.send_private_message(node_identifier, message)
-                        elif cmd.startswith('/resolve '):
-                            # Parse resolve command: /resolve <pattern>
+                        elif cmd.startswith('/resolve'):
+                            # Parse resolve command: /resolve [pattern]
                             parts = user_input.split(' ', 1)
                             if len(parts) < 2:
-                                print("Usage: /resolve <pattern>")
-                                print("Example: /resolve *my_node*")
-                                print("Example: /resolve test*")
-                                print("Example: /resolve *device")
-                                print("Supports wildcards: * matches any characters")
+                                # No pattern provided, default to * (match all)
+                                pattern = '*'
                             else:
                                 pattern = parts[1]
-                                self.show_resolve(pattern)
+                            self.show_resolve(pattern)
                         elif cmd.startswith('/setname '):
                             # Parse setname command: /setname <long_name> <short_name>
                             parts = user_input.split(' ', 2)

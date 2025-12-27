@@ -4,15 +4,17 @@ A simple yet powerful text mode client for Meshtastic mesh networking devices, d
 
 ## Features
 
-- 🚀 **Simple & Fast**: Lightweight terminal interface
-- 📡 **Real-time Messaging**: Send and receive messages instantly via serial connection
-- 📜 **Message History**: Automatic message logging with JSON storage
-- 🔌 **Serial Connection**: Direct USB/serial connection to Meshtastic device
-- 🔍 **Auto-detection**: Automatically finds your Meshtastic device on serial ports
-- 🌐 **Cross-platform**: Works on Windows, Linux, and macOS
-- 💬 **Interactive Mode**: Full-featured interactive terminal interface
-- 🎯 **Command Mode**: Send messages and get status from command line
-- 📋 **Port Listing**: List available serial ports to find your device
+- **Simple & Fast**: Lightweight terminal interface
+- **Real-time Messaging**: Send and receive messages instantly via serial connection
+- **Message History**: Automatic message logging with JSON storage
+- **End-to-End Encryption**: Encrypt private messages with per-node keys
+- **Serial Connection**: Direct USB/serial connection to Meshtastic device
+- **Auto-detection**: Automatically finds your Meshtastic device on serial ports
+- **Cross-platform**: Works on Windows, Linux, and macOS
+- **Interactive Mode**: Full-featured interactive terminal interface
+- **Port Listing**: List available serial ports to find your device
+- **Node Discovery**: Find nodes by name with wildcard support
+- **Node Information**: View hop count, last seen time, and position data
 
 ## Installation
 
@@ -25,8 +27,10 @@ A simple yet powerful text mode client for Meshtastic mesh networking devices, d
    
    Or directly:
    ```bash
-   pip install meshtastic
+   pip install meshtastic pypubsub cryptography
    ```
+   
+   **Note:** The `cryptography` library is required for encryption features. If you don't need encryption, you can skip it, but encryption features will be unavailable.
 
 3. **Make the script executable** (Linux/macOS):
    ```bash
@@ -49,70 +53,58 @@ Or on Linux/macOS:
 ```
 
 **Interactive Commands:**
-- Type any message and press Enter to send (broadcast)
-- `/help` - Show help
-- `/status` - Show device status
-- `/nodes` - List connected nodes with their IDs
-- `/pm <node_id> <message>` - Send a private message to a specific node
+- `/help` - Show help and available commands
+- `/status` - Show device status and connection information
+- `/nodes [pattern]` - List connected nodes (supports wildcard patterns)
+- `/resolve <pattern>` - Find node IDs by name pattern (supports wildcards)
+- `/pm <node_id_or_name> <message>` - Send a private message (supports node ID or exact name match)
+- `/broadcast <message>` - Send a broadcast message to all nodes
+- `/setkey <node_id_or_name> <password>` - Set encryption key for private messages with a node
+- `/setname <long_name> <short_name>` - Set your device's name
+- `/reboot [delay]` - Reboot the device (optional delay in seconds)
 - `/history` - Show message history
 - `/clear` - Clear screen
 - `/quit` - Exit client
 
-**Private Messages:**
-To send a private message to a specific node:
-1. Use `/nodes` to see available nodes and their IDs
-2. Use `/pm <node_id> <message>` to send a private message
-   Example: `/pm 1234567890 Hello, this is private!`
+**Sending Messages:**
+- Use `/broadcast <message>` to send a message to all nodes
+- Use `/pm <node_id_or_name> <message>` to send a private message
+  - Example: `/pm 1234567890 Hello, this is private!`
+  - Example: `/pm joker13 Hello!` (uses exact name match)
 
-### Command Line Mode
+**Finding Nodes:**
+- Use `/nodes` to see all available nodes with hop count and last seen time
+- Use `/nodes *pattern*` to filter nodes by name pattern
+- Use `/resolve <pattern>` to find node IDs by name (supports wildcards like `*my_node*`)
 
-Send a broadcast message and exit:
-```bash
-python meshastic_client.py -s "Hello, Meshtastic!"
-```
+**Encryption:**
+- Use `/setkey <node_id_or_name> <password>` to set an encryption key for a node
+- Both parties must use the same password for encryption to work
+- Private messages are automatically encrypted if a key is set
+- Keys are stored in `meshastic_keys.json`
 
-Send a private message and exit:
-```bash
-python meshastic_client.py --pm 1234567890 "Hello, this is private!"
-```
-
-Show device status:
-```bash
-python meshastic_client.py --status
-```
-
-List connected nodes:
-```bash
-python meshastic_client.py --nodes
-```
-
-Show message history:
-```bash
-python meshastic_client.py --history
-```
+### Command Line Options
 
 List available serial ports:
 ```bash
 python meshastic_client.py --list-ports
 ```
 
-### Specify Serial Port
-
-If auto-detection doesn't work, specify the port manually:
+Specify a serial port (if auto-detection doesn't work):
 
 **Windows:**
 ```bash
-python meshastic_client.py -p COM3
+python meshastic_client.py --port COM3
 ```
 
 **Linux:**
 ```bash
-python meshastic_client.py -p /dev/ttyUSB0
+python meshastic_client.py --port /dev/ttyUSB0
 ```
 
 **macOS:**
 ```bash
-python meshastic_client.py -p /dev/cu.usbserial-*
+python meshastic_client.py --port /dev/cu.usbserial-*
 ```
 
 ## Message History
@@ -121,47 +113,67 @@ Messages are automatically saved to `meshastic_history.json` in the current dire
 - Timestamp
 - Sender information
 - Message text
+- Encryption status
 
-You can change the history file location with `--history-file`:
-```bash
-python meshastic_client.py --history-file /path/to/history.json
-```
+## Encryption Keys
+
+Encryption keys are stored in `meshastic_keys.json` in the current directory. Each node has its own encryption key:
+- Keys are derived from passwords using PBKDF2
+- Each node encrypts messages with its own key
+- Recipients decrypt messages using the sender's key
+- Both clients can share the same keys file for seamless communication
+
+**Important:** For encryption to work, both parties must have the same key file or set the same password for each other's node ID.
 
 ## Examples
-
-**Quick message:**
-```bash
-python meshastic_client.py -s "Status check: All good!"
-```
 
 **Interactive session:**
 ```bash
 $ python meshastic_client.py
 Connecting to Meshtastic device...
-✓ Connected to device: My Mesh Node
+Connected to device: My Mesh Node
   Node ID: 1234567890
 
 === Meshastic Client ===
 Commands:
   /help     - Show this help
   /status   - Show device status
-  /nodes    - List connected nodes
+  /nodes    - List connected nodes: /nodes [pattern] (supports wildcards)
+  /pm       - Send private message: /pm <node_id_or_name> <message>
+  /resolve  - Resolve name to node ID: /resolve <pattern> (supports wildcards)
+  /broadcast - Send broadcast message: /broadcast <message>
+  /setkey   - Set encryption key for node: /setkey <node_id_or_name> <password>
   /history  - Show message history
   /clear    - Clear screen
   /quit     - Exit client
 
-Type a message to send, or use commands above.
+Use commands to send messages. Type /help for available commands.
 
-> Hello, mesh network!
-✓ Message sent: Hello, mesh network!
+> /nodes
+--- Node ID: 1234567890 (My Mesh Node / MESH) [CURRENT DEVICE] ---
+id: !a1b2c3d4
+longName: My Mesh Node
+shortName: MESH
+hopsAway: 0
+...
+
+> /broadcast Hello, mesh network!
+Message sent: Hello, mesh network!
 
 [2024-01-15T10:30:45] Node123: Thanks for the message!
-> /status
 
-=== Device Status ===
-Node ID: 1234567890
-Long Name: My Mesh Node
-Short Name: MESH
+> /pm 9876543210 Hello, this is private!
+Private message sent to node 9876543210
+
+> /setkey 9876543210 mySecretPassword
+[OK] Encryption key set for node 9876543210
+  Private messages with this node will now be encrypted
+  Make sure the other party uses the same password!
+
+> /resolve *node*
+  Node ID: 1234567890 - My Mesh Node (MESH) [CURRENT DEVICE]
+  Node ID: 9876543210 - Another Node (AN)
+
 > /quit
 Disconnected from device
 ```
@@ -171,6 +183,8 @@ Disconnected from device
 - Python 3.7 or higher
 - Meshtastic device connected via USB/serial port
 - `meshtastic` Python library (includes pyserial for serial communication)
+- `pypubsub` library (for message reception)
+- `cryptography` library (optional, for encryption features)
 
 ## Troubleshooting
 
@@ -191,6 +205,13 @@ sudo usermod -a -G dialout $USER
 ```bash
 pip install --upgrade meshtastic
 ```
+
+**Encryption not working:**
+- Make sure the `cryptography` library is installed: `pip install cryptography`
+- Verify that both parties have set the same password for each other's node ID
+- Check that keys are stored correctly in `meshastic_keys.json`
+- Ensure you're using the node ID (not user ID) when setting keys
+- Messages are encrypted with the sender's key and decrypted with the sender's key (each node has its own key)
 
 ## License
 
