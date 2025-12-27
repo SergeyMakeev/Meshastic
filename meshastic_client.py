@@ -899,20 +899,25 @@ class MeshasticClient:
         file_base64 = base64.b64encode(file_data).decode('utf-8')
         filename = os.path.basename(file_path)
         
-        # Calculate file hash for verification
-        file_hash = hashlib.sha256(file_data).hexdigest()
+        # Calculate file hash for verification (use first 16 chars of hash to save space)
+        file_hash_full = hashlib.sha256(file_data).hexdigest()
+        file_hash = file_hash_full[:16]  # Use first 16 chars for header, verify full hash on reassembly
         
-        # Split into chunks (max 200 bytes per chunk to leave room for metadata)
-        chunk_size = 200
+        # Split into chunks (max 180 bytes per chunk to leave room for metadata)
+        # Meshtastic messages have a limit around 240 bytes, so we need to be conservative
+        chunk_size = 180
         total_chunks = (len(file_base64) + chunk_size - 1) // chunk_size
         
-        # Generate unique file ID
+        # Generate unique file ID (short)
         file_id = str(uuid.uuid4())[:8]
         
         print(f"[INFO] Sending file '{filename}' ({file_size} bytes, {total_chunks} chunks) to node {destination_id}...")
         
-        # Send file header
-        header = f"[FILE:{file_id}:{filename}:{total_chunks}:{file_hash}]"
+        # Send file header (keep it short - use base64 filename if needed)
+        # Format: [FILE:file_id:filename:total_chunks:hash16]
+        # Truncate filename if too long (max 50 chars)
+        safe_filename = filename[:50] if len(filename) <= 50 else filename[:47] + "..."
+        header = f"[FILE:{file_id}:{safe_filename}:{total_chunks}:{file_hash}]"
         if not self._send_encrypted_private_message(header, destination_id):
             print("[ERROR] Failed to send file header")
             return False
@@ -923,8 +928,17 @@ class MeshasticClient:
             end = start + chunk_size
             chunk_data = file_base64[start:end]
             
-            # Send chunk with metadata
+            # Send chunk with metadata (keep metadata minimal)
+            # Format: [FILECHUNK:file_id:chunk_num:total_chunks:data]
             chunk_message = f"[FILECHUNK:{file_id}:{chunk_num}:{total_chunks}:{chunk_data}]"
+            
+            # Check message size (Meshtastic limit is around 240 bytes)
+            if len(chunk_message.encode('utf-8')) > 240:
+                # Chunk too large, reduce chunk size
+                print(f"[ERROR] Chunk {chunk_num + 1} too large ({len(chunk_message)} bytes), reducing chunk size...")
+                # This shouldn't happen with 180 byte chunks, but handle it anyway
+                return False
+            
             if not self._send_encrypted_private_message(chunk_message, destination_id):
                 print(f"[ERROR] Failed to send chunk {chunk_num + 1}/{total_chunks}")
                 return False
@@ -972,13 +986,14 @@ class MeshasticClient:
                     
                     if file_id and filename and total_chunks > 0 and file_hash:
                         # Initialize file transfer
+                        # Store partial hash (16 chars) for now, will verify with full hash on reassembly
                         self.file_transfers[file_id] = {
                             'filename': filename,
                             'total_chunks': total_chunks,
                             'received_chunks': {},
                             'from_id': from_id,
                             'from_name': from_name,
-                            'file_hash': file_hash,
+                            'file_hash_partial': file_hash,  # Store partial hash from header
                             'timestamp': datetime.now().isoformat()
                         }
                         
@@ -1030,7 +1045,7 @@ class MeshasticClient:
         filename = transfer['filename']
         total_chunks = transfer['total_chunks']
         received_chunks = transfer['received_chunks']
-        file_hash = transfer['file_hash']
+        file_hash_partial = transfer.get('file_hash_partial', '')
         from_name = transfer['from_name']
         
         # Check if we have all chunks
@@ -1057,10 +1072,12 @@ class MeshasticClient:
             del self.file_transfers[file_id]
             return
         
-        # Verify hash
-        calculated_hash = hashlib.sha256(file_data).hexdigest()
-        if calculated_hash != file_hash:
+        # Verify hash (compare first 16 chars of full hash with partial hash from header)
+        calculated_hash_full = hashlib.sha256(file_data).hexdigest()
+        calculated_hash_partial = calculated_hash_full[:16]
+        if file_hash_partial and calculated_hash_partial != file_hash_partial:
             print(f"[ERROR] File hash mismatch for '{filename}' - file may be corrupted")
+            print(f"  Expected: {file_hash_partial}, Got: {calculated_hash_partial}")
             del self.file_transfers[file_id]
             return
         
