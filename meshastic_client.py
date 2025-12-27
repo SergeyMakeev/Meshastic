@@ -122,6 +122,7 @@ class MeshasticClient:
             iterations=100000,
             backend=default_backend()
         )
+        # Derive 32 bytes and encode to base64 (Fernet key format)
         key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
         return key
     
@@ -134,8 +135,20 @@ class MeshasticClient:
         if node_id_str in self.encryption_keys:
             try:
                 key_str = self.encryption_keys[node_id_str]
-                return base64.urlsafe_b64decode(key_str.encode())
-            except Exception:
+                # Keys in JSON are base64 strings
+                # Fernet keys are 44 characters when properly encoded
+                # If key is longer, it might be double-encoded
+                if len(key_str) > 44:
+                    # Likely double-encoded, decode once
+                    try:
+                        decoded = base64.urlsafe_b64decode(key_str.encode())
+                        return decoded
+                    except:
+                        return None
+                else:
+                    # Properly encoded, just convert string to bytes
+                    return key_str.encode()
+            except Exception as e:
                 return None
         return None
     
@@ -147,7 +160,8 @@ class MeshasticClient:
         
         try:
             key = self.derive_key_from_password(password)
-            key_str = base64.urlsafe_b64encode(key).decode()
+            # Store as string (Fernet keys are base64-encoded strings)
+            key_str = key.decode()
             self.encryption_keys[str(node_id)] = key_str
             self.save_encryption_keys()
             return True
@@ -155,14 +169,19 @@ class MeshasticClient:
             print(f"[ERROR] Failed to set encryption key: {e}")
             return False
     
-    def encrypt_message(self, text: str, node_id: str) -> Optional[str]:
-        """Encrypt a message for a specific node"""
+    def encrypt_message(self, text: str, node_id: str = None) -> Optional[str]:
+        """Encrypt a message using the sender's (our own) key"""
         if not ENCRYPTION_AVAILABLE:
             return text
         
-        key = self.get_encryption_key(node_id)
+        # Use our own node ID for encryption (each node encrypts with its own key)
+        my_node_id = self.get_my_node_id()
+        if my_node_id is None:
+            return text  # Can't get our node ID, send unencrypted
+        
+        key = self.get_encryption_key(str(my_node_id))
         if key is None:
-            return text  # No key set, send unencrypted
+            return text  # No key set for our node, send unencrypted
         
         try:
             fernet = Fernet(key)
@@ -170,11 +189,11 @@ class MeshasticClient:
             # Prefix with marker to indicate encryption
             return f"[ENCRYPTED]{base64.urlsafe_b64encode(encrypted).decode()}"
         except Exception as e:
-            print(f"[WARN] Encryption failed: {e}, sending unencrypted")
+            print(f"[WARN] Encryption failed for our node {my_node_id}: {e}, sending unencrypted")
             return text
     
     def decrypt_message(self, text: str, from_id: str) -> str:
-        """Decrypt a message from a specific node"""
+        """Decrypt a message from a specific node using the sender's key"""
         if not ENCRYPTION_AVAILABLE:
             return text
         
@@ -182,9 +201,10 @@ class MeshasticClient:
         if not text.startswith("[ENCRYPTED]"):
             return text
         
-        key = self.get_encryption_key(from_id)
+        # Use the sender's key for decryption (each node decrypts with the sender's key)
+        key = self.get_encryption_key(str(from_id))
         if key is None:
-            return text  # No key set, return as-is (will show encrypted text)
+            return text  # No key set for sender, return as-is (will show encrypted text)
         
         try:
             encrypted_data = text[11:]  # Remove "[ENCRYPTED]" prefix
@@ -194,7 +214,11 @@ class MeshasticClient:
             return decrypted.decode('utf-8')
         except Exception as e:
             # Decryption failed - might be wrong key or corrupted data
-            return f"[DECRYPTION_FAILED: {text[:50]}...]"
+            error_msg = str(e)
+            if "InvalidToken" in error_msg or "Invalid key" in error_msg:
+                return f"[DECRYPTION_FAILED: Wrong encryption key for node {from_id}. Make sure you have the correct key for this sender stored in your keys file.]"
+            else:
+                return f"[DECRYPTION_FAILED: {error_msg}]"
     
     def list_serial_ports(self):
         """List available serial ports"""
