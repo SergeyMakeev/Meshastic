@@ -28,6 +28,18 @@ except ImportError:
     print("Also ensure pubsub is installed: pip install pypubsub")
     sys.exit(1)
 
+try:
+    from cryptography.fernet import Fernet
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    from cryptography.hazmat.backends import default_backend
+    import base64
+    ENCRYPTION_AVAILABLE = True
+except ImportError:
+    ENCRYPTION_AVAILABLE = False
+    print("Warning: cryptography library not found. Encryption will not be available.")
+    print("Install it with: pip install cryptography")
+
 # Import serial tools for port listing (meshtastic includes pyserial)
 try:
     import serial
@@ -50,6 +62,9 @@ class MeshasticClient:
         self.running = False
         self.history_file = history_file
         self.message_history: List[Dict] = []
+        self.keys_file = "meshastic_keys.json"
+        self.encryption_keys: Dict[str, str] = {}  # node_id -> base64 encoded key
+        self.load_encryption_keys()
         
     def load_history(self):
         """Load message history from file"""
@@ -76,6 +91,110 @@ class MeshasticClient:
         if len(self.message_history) > 1000:
             self.message_history = self.message_history[-1000:]
         self.save_history()
+    
+    def load_encryption_keys(self):
+        """Load encryption keys from file"""
+        if os.path.exists(self.keys_file):
+            try:
+                with open(self.keys_file, 'r') as f:
+                    self.encryption_keys = json.load(f)
+            except Exception as e:
+                print(f"Warning: Could not load encryption keys: {e}")
+                self.encryption_keys = {}
+    
+    def save_encryption_keys(self):
+        """Save encryption keys to file"""
+        try:
+            with open(self.keys_file, 'w') as f:
+                json.dump(self.encryption_keys, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Could not save encryption keys: {e}")
+    
+    def derive_key_from_password(self, password: str, salt: bytes = None) -> bytes:
+        """Derive a Fernet key from a password using PBKDF2"""
+        if salt is None:
+            salt = b'meshastic_salt_2024'  # Fixed salt for consistency
+        
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=100000,
+            backend=default_backend()
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password.encode()))
+        return key
+    
+    def get_encryption_key(self, node_id: str) -> Optional[bytes]:
+        """Get encryption key for a node"""
+        if not ENCRYPTION_AVAILABLE:
+            return None
+        
+        node_id_str = str(node_id)
+        if node_id_str in self.encryption_keys:
+            try:
+                key_str = self.encryption_keys[node_id_str]
+                return base64.urlsafe_b64decode(key_str.encode())
+            except Exception:
+                return None
+        return None
+    
+    def set_encryption_key(self, node_id: str, password: str) -> bool:
+        """Set encryption key for a node from a password"""
+        if not ENCRYPTION_AVAILABLE:
+            print("[ERROR] Encryption not available. Install cryptography: pip install cryptography")
+            return False
+        
+        try:
+            key = self.derive_key_from_password(password)
+            key_str = base64.urlsafe_b64encode(key).decode()
+            self.encryption_keys[str(node_id)] = key_str
+            self.save_encryption_keys()
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to set encryption key: {e}")
+            return False
+    
+    def encrypt_message(self, text: str, node_id: str) -> Optional[str]:
+        """Encrypt a message for a specific node"""
+        if not ENCRYPTION_AVAILABLE:
+            return text
+        
+        key = self.get_encryption_key(node_id)
+        if key is None:
+            return text  # No key set, send unencrypted
+        
+        try:
+            fernet = Fernet(key)
+            encrypted = fernet.encrypt(text.encode('utf-8'))
+            # Prefix with marker to indicate encryption
+            return f"[ENCRYPTED]{base64.urlsafe_b64encode(encrypted).decode()}"
+        except Exception as e:
+            print(f"[WARN] Encryption failed: {e}, sending unencrypted")
+            return text
+    
+    def decrypt_message(self, text: str, from_id: str) -> str:
+        """Decrypt a message from a specific node"""
+        if not ENCRYPTION_AVAILABLE:
+            return text
+        
+        # Check if message is encrypted
+        if not text.startswith("[ENCRYPTED]"):
+            return text
+        
+        key = self.get_encryption_key(from_id)
+        if key is None:
+            return text  # No key set, return as-is (will show encrypted text)
+        
+        try:
+            encrypted_data = text[11:]  # Remove "[ENCRYPTED]" prefix
+            encrypted_bytes = base64.urlsafe_b64decode(encrypted_data.encode())
+            fernet = Fernet(key)
+            decrypted = fernet.decrypt(encrypted_bytes)
+            return decrypted.decode('utf-8')
+        except Exception as e:
+            # Decryption failed - might be wrong key or corrupted data
+            return f"[DECRYPTION_FAILED: {text[:50]}...]"
     
     def list_serial_ports(self):
         """List available serial ports"""
@@ -419,13 +538,18 @@ class MeshasticClient:
                     else:
                         from_name = str(from_id)
                     
+                    # Decrypt message if it's encrypted
+                    decrypted_text = self.decrypt_message(text, str(from_id))
+                    is_encrypted = decrypted_text != text
+                    
                     timestamp = datetime.now().isoformat()
                     
                     message = {
                         'timestamp': timestamp,
                         'from_id': str(from_id),
                         'from_name': from_name,
-                        'text': text
+                        'text': decrypted_text,
+                        'encrypted': is_encrypted
                     }
                     
                     # Check if we've already seen this message (avoid duplicates)
@@ -433,7 +557,8 @@ class MeshasticClient:
                         self.add_to_history(message)
                         
                         # Display message
-                        print(f"\n[{timestamp}] {from_name} ({from_id}): {text}")
+                        enc_indicator = " [ENCRYPTED]" if is_encrypted else ""
+                        print(f"\n[{timestamp}] {from_name} ({from_id}){enc_indicator}: {decrypted_text}")
                         print("> ", end='', flush=True)
         except KeyError:
             # Ignore KeyError silently (like the working example)
@@ -503,21 +628,25 @@ class MeshasticClient:
         
         try:
             if destination_id:
+                # Private message - encrypt if key is available
+                message_to_send = self.encrypt_message(text, str(destination_id))
+                is_encrypted = message_to_send != text
+                
                 # Private message - use wantAck=True to ensure delivery
                 # Try different API formats for compatibility
                 try:
                     # Try with wantAck parameter (recommended for private messages)
-                    self.interface.sendText(text, destinationId=destination_id, wantAck=True)
+                    self.interface.sendText(message_to_send, destinationId=destination_id, wantAck=True)
                 except TypeError:
                     # Fallback if wantAck is not supported
                     try:
-                        self.interface.sendText(text, destinationId=destination_id)
+                        self.interface.sendText(message_to_send, destinationId=destination_id)
                     except Exception as e:
                         # Try alternative API format
                         if hasattr(self.interface, 'sendData'):
                             # Some versions use sendData for private messages
                             from meshtastic import portnums_pb2
-                            self.interface.sendData(text.encode('utf-8'), destinationId=destination_id, wantAck=True, portNum=portnums_pb2.TEXT_MESSAGE_APP)
+                            self.interface.sendData(message_to_send.encode('utf-8'), destinationId=destination_id, wantAck=True, portNum=portnums_pb2.TEXT_MESSAGE_APP)
                         else:
                             raise e
                 
@@ -530,7 +659,9 @@ class MeshasticClient:
                             user = node.get('user', {})
                             node_name = user.get('longName', user.get('shortName', f"Node {destination_id}"))
                             break
-                print(f"[OK] Private message sent to {node_name} ({destination_id}): {text}")
+                
+                enc_status = " [ENCRYPTED]" if is_encrypted else ""
+                print(f"[OK] Private message sent to {node_name} ({destination_id}){enc_status}: {text}")
             else:
                 # Broadcast message - require confirmation
                 if not skip_confirmation:
@@ -1129,6 +1260,7 @@ class MeshasticClient:
                             print("  /reboot   - Reboot the device: /reboot [delay_seconds]")
                             print("  /history  - Show message history")
                             print("  /broadcast - Send broadcast message: /broadcast <message>")
+                            print("  /setkey   - Set encryption key for node: /setkey <node_id_or_name> <password>")
                             print("  /clear    - Clear screen")
                             print("  /quit     - Exit client")
                             print()
@@ -1210,6 +1342,45 @@ class MeshasticClient:
                             else:
                                 message = parts[1]
                                 self.send_message(message, skip_confirmation=True)
+                        elif cmd.startswith('/setkey '):
+                            # Parse setkey command: /setkey <node_id_or_name> <password>
+                            parts = user_input.split(' ', 2)
+                            if len(parts) < 3:
+                                print("Usage: /setkey <node_id_or_name> <password>")
+                                print("Example: /setkey 1234567890 mySecretPassword")
+                                print("Example: /setkey joker13 mySecretPassword")
+                                print("Sets an encryption key for private messages with this node.")
+                                print("Both parties must use the same password for encryption to work.")
+                            else:
+                                node_identifier = parts[1]
+                                password = parts[2]
+                                
+                                # Resolve node identifier to node ID
+                                node_id = None
+                                try:
+                                    node_id = int(node_identifier)
+                                except ValueError:
+                                    # Try to resolve by name
+                                    nodes = self.get_node_info()
+                                    node_identifier_lower = node_identifier.lower()
+                                    for nid, node in nodes.items():
+                                        num = node.get('num', nid)
+                                        user = node.get('user', {})
+                                        long_name = user.get('longName', '')
+                                        short_name = user.get('shortName', '')
+                                        if (long_name and long_name.lower() == node_identifier_lower) or \
+                                           (short_name and short_name.lower() == node_identifier_lower):
+                                            node_id = num
+                                            break
+                                
+                                if node_id is None:
+                                    print(f"[ERROR] Node not found: {node_identifier}")
+                                    print("  Use /nodes to see available nodes")
+                                else:
+                                    if self.set_encryption_key(str(node_id), password):
+                                        print(f"[OK] Encryption key set for node {node_id}")
+                                        print("  Private messages with this node will now be encrypted")
+                                        print("  Make sure the other party uses the same password!")
                         elif cmd == '/clear':
                             os.system('cls' if os.name == 'nt' else 'clear')
                         else:
