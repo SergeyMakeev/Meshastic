@@ -72,6 +72,8 @@ class MeshasticClient:
         self.file_transfers: Dict[str, Dict] = {}
         # Long message transfer state: message_id -> {total_chunks, received_chunks: {chunk_num: data}, from_id, from_name, is_encrypted}
         self.message_transfers: Dict[str, Dict] = {}
+        # Orphaned chunks: chunks received before header (keyed by file_id/message_id)
+        self.orphaned_chunks: Dict[str, List[Dict]] = {}
         
     def load_history(self):
         """Load message history from file"""
@@ -838,14 +840,116 @@ class MeshasticClient:
             print("  Please use the node ID directly to avoid ambiguity")
             return False
         
-        # Single match - send the message
-        node_id, long_name, short_name = matches[0]
-        name_display = long_name if long_name else short_name
-        if not name_display:
-            name_display = f"Node {node_id}"
+        destination_id = matches[0][0]
         
-        print(f"[INFO] Sending to {name_display} (Node ID: {node_id})")
-        return self.send_message(text, destination_id=node_id)
+        if not destination_id:
+            print(f"[ERROR] Could not resolve node: {node_identifier}")
+            return False
+        
+        # Check if message is too long for a single message
+        # Meshtastic limit is around 240 bytes, but we need to account for encryption overhead
+        # If message would be too long after encryption, split it into chunks
+        raw_message_size = len(text.encode('utf-8'))
+        
+        # Estimate encrypted size (roughly 1.5x for encryption overhead)
+        estimated_encrypted_size = int(raw_message_size * 1.5)
+        
+        # If message would exceed ~200 bytes after encryption, use chunking
+        if estimated_encrypted_size > 200:
+            return self._send_long_message(text, destination_id)
+        else:
+            # Regular short message
+            return self.send_message(text, destination_id=destination_id)
+    
+    def _send_long_message(self, text: str, destination_id: int) -> bool:
+        """Send a long message by encrypting first, then splitting into chunks
+        
+        Args:
+            text: Message text to send
+            destination_id: Destination node ID
+            
+        Returns:
+            True if sent successfully, False otherwise
+        """
+        # Encrypt the entire message first (if encryption is enabled)
+        my_node_id = self.get_my_node_id()
+        if my_node_id is None:
+            print("[ERROR] Cannot get our node ID for encryption")
+            return False
+        
+        key = self.get_encryption_key(str(my_node_id))
+        if key is None:
+            print("[WARN] No encryption key set for our node, sending message unencrypted")
+            encrypted_data = text.encode('utf-8')
+            is_encrypted = False
+        else:
+            try:
+                from cryptography.fernet import Fernet
+                fernet = Fernet(key)
+                encrypted_data = fernet.encrypt(text.encode('utf-8'))
+                is_encrypted = True
+            except Exception as e:
+                print(f"[ERROR] Failed to encrypt message: {e}")
+                return False
+        
+        # Base64 encode the encrypted data
+        encrypted_base64 = base64.b64encode(encrypted_data).decode('utf-8')
+        
+        # Split encrypted data into chunks (stable chunk size - no encryption overhead per chunk)
+        # Meshtastic messages have a limit around 240 bytes
+        # We need room for: [MSGCHUNK:message_id:chunk_num:total_chunks:data]
+        # Metadata is ~30-40 bytes, so we can use ~180 bytes for data
+        chunk_size = 180
+        total_chunks = (len(encrypted_base64) + chunk_size - 1) // chunk_size
+        
+        # Generate unique message ID (short)
+        message_id = str(uuid.uuid4())[:8]
+        
+        print(f"[INFO] Sending long message ({len(text)} chars, {total_chunks} chunks) to node {destination_id}...")
+        
+        # Send message header
+        # Format: [MSG:message_id:total_chunks:encrypted]
+        is_encrypted_flag = "1" if is_encrypted else "0"
+        header = f"[MSG:{message_id}:{total_chunks}:{is_encrypted_flag}]"
+        if not self._send_encrypted_private_message(header, destination_id):
+            print("[ERROR] Failed to send message header")
+            return False
+        
+        # Send chunks (no encryption needed - data is already encrypted)
+        for chunk_num in range(total_chunks):
+            start = chunk_num * chunk_size
+            end = start + chunk_size
+            chunk_data = encrypted_base64[start:end]
+            
+            # Send chunk with metadata (no encryption - data is already encrypted)
+            # Format: [MSGCHUNK:message_id:chunk_num:total_chunks:data]
+            chunk_message = f"[MSGCHUNK:{message_id}:{chunk_num}:{total_chunks}:{chunk_data}]"
+            
+            # Check message size (should be well under 240 bytes now)
+            message_size = len(chunk_message.encode('utf-8'))
+            if message_size > 240:
+                print(f"[ERROR] Chunk {chunk_num + 1} too large ({message_size} bytes)")
+                return False
+            
+            # Send chunk directly without encryption (data is already encrypted)
+            # Use the low-level send function to avoid double encryption
+            try:
+                self.interface.sendText(chunk_message, destinationId=destination_id, wantAck=True)
+            except TypeError:
+                try:
+                    self.interface.sendText(chunk_message, destinationId=destination_id)
+                except Exception as e:
+                    print(f"[ERROR] Failed to send chunk {chunk_num + 1}/{total_chunks}: {e}")
+                    return False
+            except Exception as e:
+                print(f"[ERROR] Failed to send chunk {chunk_num + 1}/{total_chunks}: {e}")
+                return False
+            
+            # Small delay between chunks to avoid overwhelming the network
+            time.sleep(0.1)
+        
+        print(f"[OK] Long message sent successfully ({total_chunks} chunks)")
+        return True
     
     def send_file(self, node_identifier: str, file_path: str) -> bool:
         """Send a file to a specific node by ID or exact name match
@@ -955,8 +1059,8 @@ class MeshasticClient:
         # Split encrypted data into chunks (stable chunk size - no encryption overhead per chunk)
         # Meshtastic messages have a limit around 240 bytes
         # We need room for: [FILECHUNK:file_id:chunk_num:total_chunks:data]
-        # Metadata is ~30-40 bytes, so we can use ~200 bytes for data
-        chunk_size = 200
+        # Metadata is ~30-40 bytes, so we can use ~180 bytes for data
+        chunk_size = 180
         total_chunks = (len(encrypted_base64) + chunk_size - 1) // chunk_size
         
         # Generate unique file ID (short)
@@ -990,9 +1094,18 @@ class MeshasticClient:
                 print(f"[ERROR] Chunk {chunk_num + 1} too large ({message_size} bytes)")
                 return False
             
-            # Send as regular private message (no additional encryption)
-            if not self.send_message(chunk_message, destination_id=destination_id):
-                print(f"[ERROR] Failed to send chunk {chunk_num + 1}/{total_chunks}")
+            # Send chunk directly without encryption (data is already encrypted)
+            # Use the low-level send function to avoid double encryption
+            try:
+                self.interface.sendText(chunk_message, destinationId=destination_id, wantAck=True)
+            except TypeError:
+                try:
+                    self.interface.sendText(chunk_message, destinationId=destination_id)
+                except Exception as e:
+                    print(f"[ERROR] Failed to send chunk {chunk_num + 1}/{total_chunks}: {e}")
+                    return False
+            except Exception as e:
+                print(f"[ERROR] Failed to send chunk {chunk_num + 1}/{total_chunks}: {e}")
                 return False
             
             # Small delay between chunks to avoid overwhelming the network
@@ -1067,7 +1180,21 @@ class MeshasticClient:
                             'timestamp': datetime.now().isoformat()
                         }
                         
-                        print(f"\n[FILE] Receiving file '{filename}' from {from_name} ({from_id}) - {total_chunks} chunks")
+                        # Check if we have orphaned chunks for this file_id
+                        if file_id in self.orphaned_chunks:
+                            orphaned = self.orphaned_chunks[file_id]
+                            print(f"\n[FILE] Receiving file '{filename}' from {from_name} ({from_id}) - {total_chunks} chunks")
+                            if orphaned:
+                                print(f"[INFO] Found {len(orphaned)} orphaned chunks, applying them...")
+                                for orphan in orphaned:
+                                    if orphan['chunk_num'] < total_chunks:
+                                        self.file_transfers[file_id]['received_chunks'][orphan['chunk_num']] = orphan['chunk_data']
+                                # Check if we now have all chunks
+                                if len(self.file_transfers[file_id]['received_chunks']) == total_chunks:
+                                    self._reassemble_file(file_id)
+                            del self.orphaned_chunks[file_id]
+                        else:
+                            print(f"\n[FILE] Receiving file '{filename}' from {from_name} ({from_id}) - {total_chunks} chunks")
                         return True
             except Exception as e:
                 print(f"[ERROR] Failed to parse file header: {e}")
@@ -1086,8 +1213,22 @@ class MeshasticClient:
                     
                     # Check if we have this file transfer
                     if file_id not in self.file_transfers:
-                        print(f"[WARN] Received chunk for unknown file: {file_id}")
-                        return True  # Still handled, just ignored
+                        # Store as orphaned chunk - header might arrive later
+                        if file_id not in self.orphaned_chunks:
+                            self.orphaned_chunks[file_id] = []
+                        self.orphaned_chunks[file_id].append({
+                            'chunk_num': chunk_num,
+                            'total_chunks': total_chunks,
+                            'chunk_data': chunk_data,
+                            'from_id': from_id,
+                            'from_name': from_name,
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        # Only warn if we have many orphaned chunks (header might be coming)
+                        if len(self.orphaned_chunks[file_id]) > 10:
+                            # Too many orphaned chunks - header probably lost
+                            print(f"[WARN] Received {len(self.orphaned_chunks[file_id])} chunks for unknown file {file_id}, header may be missing")
+                        return True  # Still handled
                     
                     transfer = self.file_transfers[file_id]
                     
@@ -1134,7 +1275,21 @@ class MeshasticClient:
                             'timestamp': datetime.now().isoformat()
                         }
                         
-                        print(f"\n[MSG] Receiving long message from {from_name} ({from_id}) - {total_chunks} chunks")
+                        # Check if we have orphaned chunks for this message_id
+                        if message_id in self.orphaned_chunks:
+                            orphaned = self.orphaned_chunks[message_id]
+                            print(f"\n[MSG] Receiving long message from {from_name} ({from_id}) - {total_chunks} chunks")
+                            if orphaned:
+                                print(f"[INFO] Found {len(orphaned)} orphaned chunks, applying them...")
+                                for orphan in orphaned:
+                                    if orphan['chunk_num'] < total_chunks:
+                                        self.message_transfers[message_id]['received_chunks'][orphan['chunk_num']] = orphan['chunk_data']
+                                # Check if we now have all chunks
+                                if len(self.message_transfers[message_id]['received_chunks']) == total_chunks:
+                                    self._reassemble_message(message_id)
+                            del self.orphaned_chunks[message_id]
+                        else:
+                            print(f"\n[MSG] Receiving long message from {from_name} ({from_id}) - {total_chunks} chunks")
                         return True
             except Exception as e:
                 print(f"[ERROR] Failed to parse message header: {e}")
@@ -1153,8 +1308,22 @@ class MeshasticClient:
                     
                     # Check if we have this message transfer
                     if message_id not in self.message_transfers:
-                        print(f"[WARN] Received chunk for unknown message: {message_id}")
-                        return True  # Still handled, just ignored
+                        # Store as orphaned chunk - header might arrive later
+                        if message_id not in self.orphaned_chunks:
+                            self.orphaned_chunks[message_id] = []
+                        self.orphaned_chunks[message_id].append({
+                            'chunk_num': chunk_num,
+                            'total_chunks': total_chunks,
+                            'chunk_data': chunk_data,
+                            'from_id': from_id,
+                            'from_name': from_name,
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        # Only warn if we have many orphaned chunks (header might be coming)
+                        if len(self.orphaned_chunks[message_id]) > 10:
+                            # Too many orphaned chunks - header probably lost
+                            print(f"[WARN] Received {len(self.orphaned_chunks[message_id])} chunks for unknown message {message_id}, header may be missing")
+                        return True  # Still handled
                     
                     transfer = self.message_transfers[message_id]
                     
