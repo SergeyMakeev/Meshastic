@@ -137,18 +137,23 @@ class MeshasticClient:
                 key_str = self.encryption_keys[node_id_str]
                 # Keys in JSON are base64 strings
                 # Fernet keys are 44 characters when properly encoded
-                # If key is longer, it might be double-encoded
+                # If key is longer (60 chars), it's double-encoded from old version
                 if len(key_str) > 44:
-                    # Likely double-encoded, decode once
+                    # Double-encoded: decode once to get the actual Fernet key
                     try:
                         decoded = base64.urlsafe_b64decode(key_str.encode())
-                        return decoded
-                    except:
+                        # decoded is now 44 bytes, which contains the base64-encoded key as a string
+                        # Convert bytes to string, then back to bytes for Fernet
+                        key_string = decoded.decode('utf-8')
+                        return key_string.encode()
+                    except Exception as e:
+                        print(f"[DEBUG] Failed to decode double-encoded key for {node_id_str}: {e}")
                         return None
                 else:
-                    # Properly encoded, just convert string to bytes
+                    # Properly encoded (44 chars): just convert string to bytes
                     return key_str.encode()
             except Exception as e:
+                print(f"[DEBUG] Error getting key for {node_id_str}: {e}")
                 return None
         return None
     
@@ -204,7 +209,7 @@ class MeshasticClient:
         # Use the sender's key for decryption (each node decrypts with the sender's key)
         key = self.get_encryption_key(str(from_id))
         if key is None:
-            return text  # No key set for sender, return as-is (will show encrypted text)
+            return f"[ENCRYPTED_MESSAGE: No key available for node {from_id}]"
         
         try:
             encrypted_data = text[11:]  # Remove "[ENCRYPTED]" prefix
