@@ -903,9 +903,15 @@ class MeshasticClient:
         file_hash_full = hashlib.sha256(file_data).hexdigest()
         file_hash = file_hash_full[:16]  # Use first 16 chars for header, verify full hash on reassembly
         
-        # Split into chunks (max 180 bytes per chunk to leave room for metadata)
-        # Meshtastic messages have a limit around 240 bytes, so we need to be conservative
-        chunk_size = 180
+        # Split into chunks (max 100 bytes per chunk to leave room for metadata and encryption)
+        # Meshtastic messages have a limit around 240 bytes
+        # We need to account for:
+        # - FILECHUNK metadata: ~27 bytes ([FILECHUNK:file_id:chunk_num:total_chunks:])
+        # - [ENCRYPTED] prefix: 11 bytes
+        # - Base64 encoding overhead from encryption: ~33% increase
+        # - Base64 encoding of chunk data itself
+        # So 100 bytes of base64 data + metadata + encryption overhead should fit safely
+        chunk_size = 100
         total_chunks = (len(file_base64) + chunk_size - 1) // chunk_size
         
         # Generate unique file ID (short)
@@ -932,11 +938,13 @@ class MeshasticClient:
             # Format: [FILECHUNK:file_id:chunk_num:total_chunks:data]
             chunk_message = f"[FILECHUNK:{file_id}:{chunk_num}:{total_chunks}:{chunk_data}]"
             
-            # Check message size (Meshtastic limit is around 240 bytes)
-            if len(chunk_message.encode('utf-8')) > 240:
-                # Chunk too large, reduce chunk size
-                print(f"[ERROR] Chunk {chunk_num + 1} too large ({len(chunk_message)} bytes), reducing chunk size...")
-                # This shouldn't happen with 180 byte chunks, but handle it anyway
+            # Check message size before encryption (Meshtastic limit is around 240 bytes after encryption)
+            # The message will be encrypted, which adds [ENCRYPTED] prefix and base64 encoding overhead
+            # So we need to keep the raw message smaller - aim for ~180 bytes max before encryption
+            raw_message_size = len(chunk_message.encode('utf-8'))
+            if raw_message_size > 180:
+                # Chunk too large even before encryption
+                print(f"[ERROR] Chunk {chunk_num + 1} too large ({raw_message_size} bytes before encryption)")
                 return False
             
             if not self._send_encrypted_private_message(chunk_message, destination_id):
