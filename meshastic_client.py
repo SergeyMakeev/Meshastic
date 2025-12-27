@@ -556,19 +556,25 @@ class MeshasticClient:
                     from_id = packet.get('fromId', 'Unknown')
                     from_name = 'Unknown'
                     
-                    # Try to get sender name from nodes
+                    # Try to get sender name and node ID from nodes
+                    node_id_for_key = None
                     if self.interface and hasattr(self.interface, 'nodes'):
                         nodes = self.interface.nodes
                         if from_id in nodes:
-                            user = nodes[from_id].get('user', {})
+                            node = nodes[from_id]
+                            user = node.get('user', {})
                             from_name = user.get('longName', user.get('shortName', str(from_id)))
+                            # Get the node ID (num) for key lookup
+                            node_id_for_key = node.get('num', from_id)
                         else:
                             from_name = str(from_id)
+                            node_id_for_key = from_id
                     else:
                         from_name = str(from_id)
+                        node_id_for_key = from_id
                     
-                    # Decrypt message if it's encrypted
-                    decrypted_text = self.decrypt_message(text, str(from_id))
+                    # Decrypt message if it's encrypted (use node ID for key lookup)
+                    decrypted_text = self.decrypt_message(text, str(node_id_for_key))
                     is_encrypted = decrypted_text != text
                     
                     timestamp = datetime.now().isoformat()
