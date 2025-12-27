@@ -1123,10 +1123,13 @@ class MeshasticClient:
         # Check for file header
         if text.startswith("[FILE:"):
             try:
-                # Parse: [FILE:file_id:filename:total_chunks:hash]
+                # Parse: [FILE:file_id:filename:total_chunks:hash:encrypted]
                 # Filename might contain colons, so parse from the end
-                if text.endswith(']'):
-                    content = text[6:-1]  # Remove [FILE: and ]
+                if not text.endswith(']'):
+                    # Header doesn't end with ], might be malformed
+                    print(f"[DEBUG] File header doesn't end with ]: {text!r}")
+                    return False
+                content = text[6:-1]  # Remove [FILE: and ]
                     # Find the last 3 colons (for total_chunks, file_hash, and end)
                     last_colon_idx = content.rfind(':')
                     if last_colon_idx == -1:
@@ -1196,8 +1199,14 @@ class MeshasticClient:
                         else:
                             print(f"\n[FILE] Receiving file '{filename}' from {from_name} ({from_id}) - {total_chunks} chunks")
                         return True
+                    else:
+                        # Parsing succeeded but required fields are missing - this shouldn't happen
+                        print(f"[DEBUG] File header parsing incomplete: file_id={file_id!r}, filename={filename!r}, total_chunks={total_chunks}, file_hash={file_hash!r}")
+                        return False
             except Exception as e:
                 print(f"[ERROR] Failed to parse file header: {e}")
+                import traceback
+                traceback.print_exc()
                 return False
         
         # Check for file chunk
@@ -1225,9 +1234,10 @@ class MeshasticClient:
                             'timestamp': datetime.now().isoformat()
                         })
                         # Only warn if we have many orphaned chunks (header might be coming)
-                        if len(self.orphaned_chunks[file_id]) > 10:
-                            # Too many orphaned chunks - header probably lost
-                            print(f"[WARN] Received {len(self.orphaned_chunks[file_id])} chunks for unknown file {file_id}, header may be missing")
+                        # But also check if we have all chunks - header probably lost
+                        if len(self.orphaned_chunks[file_id]) >= total_chunks:
+                            # We have all chunks but no header - header probably lost
+                            print(f"[WARN] Received {len(self.orphaned_chunks[file_id])}/{total_chunks} chunks for unknown file {file_id}, header may be missing")
                         return True  # Still handled
                     
                     transfer = self.file_transfers[file_id]
