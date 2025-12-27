@@ -1124,42 +1124,55 @@ class MeshasticClient:
         if text.startswith("[FILE:"):
             try:
                 # Parse: [FILE:file_id:filename:total_chunks:hash:encrypted]
+                # Format: [FILE:file_id:filename:total_chunks:hash16:encrypted_flag]
                 # Filename might contain colons, so parse from the end
                 if not text.endswith(']'):
                     # Header doesn't end with ], might be malformed
                     print(f"[DEBUG] File header doesn't end with ]: {text!r}")
                     return False
                 content = text[6:-1]  # Remove [FILE: and ]
-                # Find the last 3 colons (for total_chunks, file_hash, and end)
+                
+                # Parse from the end: encrypted_flag, hash, total_chunks, then filename and file_id
+                # Find the last colon (should be encryption flag '0' or '1')
                 last_colon_idx = content.rfind(':')
                 if last_colon_idx == -1:
+                    print(f"[DEBUG] No last colon found in: {content!r}")
                     return False
-                file_hash = content[last_colon_idx+1:]
-                content = content[:last_colon_idx]
+                potential_flag = content[last_colon_idx+1:]
                 
-                second_last_colon_idx = content.rfind(':')
-                if second_last_colon_idx == -1:
+                # Check if last part is encryption flag (new format) or hash (old format)
+                if potential_flag in ['0', '1']:
+                    # New format with encryption flag
+                    encryption_flag = potential_flag
+                    content = content[:last_colon_idx]  # Remove encryption flag
+                    
+                    # Find the hash (16 chars) before the encryption flag
+                    hash_colon_idx = content.rfind(':')
+                    if hash_colon_idx == -1:
+                        return False
+                    file_hash = content[hash_colon_idx+1:]
+                    if len(file_hash) != 16:
+                        return False
+                    content = content[:hash_colon_idx]  # Remove hash
+                else:
+                    # Old format without encryption flag - last part is the hash
+                    encryption_flag = '0'  # Default to unencrypted
+                    file_hash = potential_flag
+                    if len(file_hash) != 16:
+                        return False
+                    content = content[:last_colon_idx]  # Remove hash
+                
+                # Find total_chunks
+                chunks_colon_idx = content.rfind(':')
+                if chunks_colon_idx == -1:
                     return False
-                # Check if there's an encryption flag (new format) or just total_chunks (old format)
-                encryption_flag = None
                 try:
-                    # Try to parse as encryption flag first
-                    potential_flag = content[second_last_colon_idx+1:]
-                    if potential_flag in ['0', '1']:
-                        # This is the encryption flag, get total_chunks from previous colon
-                        encryption_flag = potential_flag
-                        content = content[:second_last_colon_idx]
-                        second_last_colon_idx = content.rfind(':')
-                        if second_last_colon_idx == -1:
-                            return False
-                        total_chunks = int(content[second_last_colon_idx+1:])
-                    else:
-                        # Old format, no encryption flag
-                        total_chunks = int(potential_flag)
+                    total_chunks = int(content[chunks_colon_idx+1:])
                 except ValueError:
                     return False
-                content = content[:second_last_colon_idx]
+                content = content[:chunks_colon_idx]  # Remove total_chunks
                 
+                # Remaining is file_id:filename (filename might contain colons)
                 first_colon_idx = content.find(':')
                 if first_colon_idx == -1:
                     return False
@@ -1201,12 +1214,9 @@ class MeshasticClient:
                     return True
                 else:
                     # Parsing succeeded but required fields are missing - this shouldn't happen
-                    print(f"[DEBUG] File header parsing incomplete: file_id={file_id!r}, filename={filename!r}, total_chunks={total_chunks}, file_hash={file_hash!r}")
                     return False
             except Exception as e:
                 print(f"[ERROR] Failed to parse file header: {e}")
-                import traceback
-                traceback.print_exc()
                 return False
         
         # Check for file chunk
@@ -1244,6 +1254,11 @@ class MeshasticClient:
                     
                     # Store chunk
                     transfer['received_chunks'][chunk_num] = chunk_data
+                    
+                    # Display progress
+                    received_count = len(transfer['received_chunks'])
+                    total_count = transfer['total_chunks']
+                    print(f"[FILE] Received chunk {received_count}/{total_count} for '{transfer['filename']}'")
                     
                     # Check if all chunks received
                     if len(transfer['received_chunks']) == transfer['total_chunks']:
@@ -1439,6 +1454,8 @@ class MeshasticClient:
         total_chunks = transfer['total_chunks']
         received_chunks = transfer['received_chunks']
         file_hash_partial = transfer.get('file_hash_partial', '')
+        is_encrypted = transfer.get('is_encrypted', False)
+        from_id = transfer.get('from_id')
         from_name = transfer['from_name']
         
         # Check if we have all chunks
@@ -1446,7 +1463,7 @@ class MeshasticClient:
             print(f"[ERROR] Missing chunks for file '{filename}': {len(received_chunks)}/{total_chunks}")
             return
         
-        # Reassemble base64 string
+        # Reassemble base64 string (this is the encrypted data if encrypted)
         chunks = []
         for i in range(total_chunks):
             if i not in received_chunks:
@@ -1459,13 +1476,39 @@ class MeshasticClient:
         
         # Decode from base64
         try:
-            file_data = base64.b64decode(file_base64)
+            encrypted_file_data = base64.b64decode(file_base64)
         except Exception as e:
             print(f"[ERROR] Failed to decode file data: {e}")
             del self.file_transfers[file_id]
             return
         
+        # Decrypt if needed
+        if is_encrypted:
+            if not from_id:
+                print(f"[ERROR] Cannot decrypt file '{filename}' - missing sender ID")
+                del self.file_transfers[file_id]
+                return
+            
+            # Get sender's key for decryption
+            key = self.get_encryption_key(str(from_id))
+            if key is None:
+                print(f"[ERROR] No encryption key available for node {from_id} to decrypt file '{filename}'")
+                del self.file_transfers[file_id]
+                return
+            
+            try:
+                from cryptography.fernet import Fernet
+                fernet = Fernet(key)
+                file_data = fernet.decrypt(encrypted_file_data)
+            except Exception as e:
+                print(f"[ERROR] Failed to decrypt file '{filename}': {e}")
+                del self.file_transfers[file_id]
+                return
+        else:
+            file_data = encrypted_file_data
+        
         # Verify hash (compare first 16 chars of full hash with partial hash from header)
+        # Hash is calculated on the original (decrypted) file data
         calculated_hash_full = hashlib.sha256(file_data).hexdigest()
         calculated_hash_partial = calculated_hash_full[:16]
         if file_hash_partial and calculated_hash_partial != file_hash_partial:
