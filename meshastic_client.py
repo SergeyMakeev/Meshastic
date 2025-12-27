@@ -17,6 +17,9 @@ from typing import Optional, List, Dict
 import json
 import os
 import fnmatch
+import base64
+import hashlib
+import uuid
 
 try:
     import meshtastic
@@ -65,6 +68,8 @@ class MeshasticClient:
         self.keys_file = "meshastic_keys.json"
         self.encryption_keys: Dict[str, str] = {}  # node_id -> base64 encoded key
         self.load_encryption_keys()
+        # File transfer state: file_id -> {filename, total_chunks, received_chunks: {chunk_num: data}, from_id, from_name}
+        self.file_transfers: Dict[str, Dict] = {}
         
     def load_history(self):
         """Load message history from file"""
@@ -577,6 +582,12 @@ class MeshasticClient:
                     decrypted_text = self.decrypt_message(text, str(node_id_for_key))
                     is_encrypted = decrypted_text != text
                     
+                    # Check if this is a file transfer message
+                    if self._handle_file_chunk(decrypted_text, str(node_id_for_key), from_name):
+                        # File message handled, don't display as regular message
+                        print("> ", end='', flush=True)
+                        return  # Exit early, file message already handled
+                    
                     timestamp = datetime.now().isoformat()
                     
                     message = {
@@ -655,6 +666,47 @@ class MeshasticClient:
         except Exception:
             pass
     
+    def _send_encrypted_private_message(self, text: str, destination_id: int) -> bool:
+        """Send an encrypted private message to a specific node (reusable function)
+        
+        Args:
+            text: Message text to send
+            destination_id: Destination node ID
+            
+        Returns:
+            True if sent successfully, False otherwise
+        """
+        if not self.interface:
+            return False
+        
+        try:
+            # Encrypt if key is available
+            message_to_send = self.encrypt_message(text, str(destination_id))
+            is_encrypted = message_to_send != text
+            
+            # Private message - use wantAck=True to ensure delivery
+            # Try different API formats for compatibility
+            try:
+                # Try with wantAck parameter (recommended for private messages)
+                self.interface.sendText(message_to_send, destinationId=destination_id, wantAck=True)
+            except TypeError:
+                # Fallback if wantAck is not supported
+                try:
+                    self.interface.sendText(message_to_send, destinationId=destination_id)
+                except Exception as e:
+                    # Try alternative API format
+                    if hasattr(self.interface, 'sendData'):
+                        # Some versions use sendData for private messages
+                        from meshtastic import portnums_pb2
+                        self.interface.sendData(message_to_send.encode('utf-8'), destinationId=destination_id, wantAck=True, portNum=portnums_pb2.TEXT_MESSAGE_APP)
+                    else:
+                        raise e
+            
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to send private message: {e}")
+            return False
+    
     def send_message(self, text: str, destination_id: Optional[int] = None, skip_confirmation: bool = False) -> bool:
         """Send a text message (broadcast or private)"""
         if not self.interface:
@@ -663,27 +715,12 @@ class MeshasticClient:
         
         try:
             if destination_id:
-                # Private message - encrypt if key is available
-                message_to_send = self.encrypt_message(text, str(destination_id))
-                is_encrypted = message_to_send != text
+                # Private message - use reusable function
+                is_encrypted = self.encrypt_message(text, str(destination_id)) != text
+                success = self._send_encrypted_private_message(text, destination_id)
                 
-                # Private message - use wantAck=True to ensure delivery
-                # Try different API formats for compatibility
-                try:
-                    # Try with wantAck parameter (recommended for private messages)
-                    self.interface.sendText(message_to_send, destinationId=destination_id, wantAck=True)
-                except TypeError:
-                    # Fallback if wantAck is not supported
-                    try:
-                        self.interface.sendText(message_to_send, destinationId=destination_id)
-                    except Exception as e:
-                        # Try alternative API format
-                        if hasattr(self.interface, 'sendData'):
-                            # Some versions use sendData for private messages
-                            from meshtastic import portnums_pb2
-                            self.interface.sendData(message_to_send.encode('utf-8'), destinationId=destination_id, wantAck=True, portNum=portnums_pb2.TEXT_MESSAGE_APP)
-                        else:
-                            raise e
+                if not success:
+                    return False
                 
                 # Try to get node name for display
                 node_name = f"Node {destination_id}"
@@ -782,6 +819,276 @@ class MeshasticClient:
         
         print(f"[INFO] Sending to {name_display} (Node ID: {node_id})")
         return self.send_message(text, destination_id=node_id)
+    
+    def send_file(self, node_identifier: str, file_path: str) -> bool:
+        """Send a file to a specific node by ID or exact name match
+        
+        Args:
+            node_identifier: Node ID (number) or exact node name (long name or short name)
+            file_path: Path to the file to send
+            
+        Returns:
+            True if file transfer started successfully, False otherwise
+        """
+        # Check if file exists
+        if not os.path.exists(file_path):
+            print(f"[ERROR] File not found: {file_path}")
+            return False
+        
+        # Check file size (512KB limit)
+        file_size = os.path.getsize(file_path)
+        max_size = 512 * 1024  # 512KB
+        if file_size > max_size:
+            print(f"[ERROR] File too large: {file_size} bytes (max {max_size} bytes)")
+            return False
+        
+        # Resolve node identifier to node ID (same logic as send_private_message)
+        destination_id = None
+        try:
+            destination_id = int(node_identifier)
+        except ValueError:
+            # Try to find exact name match
+            nodes = self.get_node_info()
+            if not nodes:
+                print("[ERROR] No node information available")
+                return False
+            
+            node_identifier_lower = node_identifier.lower()
+            matches = []
+            
+            for node_id, node in nodes.items():
+                num = node.get('num', node_id)
+                user = node.get('user', {})
+                long_name = user.get('longName', '')
+                short_name = user.get('shortName', '')
+                
+                if (long_name and long_name.lower() == node_identifier_lower) or \
+                   (short_name and short_name.lower() == node_identifier_lower):
+                    matches.append((num, long_name, short_name))
+            
+            if not matches:
+                print(f"[ERROR] No nodes found with exact name: {node_identifier}")
+                print("  Use /nodes to see available nodes")
+                return False
+            
+            if len(matches) > 1:
+                print(f"[ERROR] Multiple nodes found with name '{node_identifier}':")
+                for node_id, long_name, short_name in matches:
+                    name_display = long_name if long_name else short_name
+                    if not name_display:
+                        name_display = f"Node {node_id}"
+                    print(f"  Node ID: {node_id} - {name_display} ({short_name if short_name else 'N/A'})")
+                print("  Please use the node ID directly to avoid ambiguity")
+                return False
+            
+            destination_id = matches[0][0]
+        
+        if not destination_id:
+            print(f"[ERROR] Could not resolve node: {node_identifier}")
+            return False
+        
+        # Read and encode file
+        try:
+            with open(file_path, 'rb') as f:
+                file_data = f.read()
+        except Exception as e:
+            print(f"[ERROR] Failed to read file: {e}")
+            return False
+        
+        # Encode to base64
+        file_base64 = base64.b64encode(file_data).decode('utf-8')
+        filename = os.path.basename(file_path)
+        
+        # Calculate file hash for verification
+        file_hash = hashlib.sha256(file_data).hexdigest()
+        
+        # Split into chunks (max 200 bytes per chunk to leave room for metadata)
+        chunk_size = 200
+        total_chunks = (len(file_base64) + chunk_size - 1) // chunk_size
+        
+        # Generate unique file ID
+        file_id = str(uuid.uuid4())[:8]
+        
+        print(f"[INFO] Sending file '{filename}' ({file_size} bytes, {total_chunks} chunks) to node {destination_id}...")
+        
+        # Send file header
+        header = f"[FILE:{file_id}:{filename}:{total_chunks}:{file_hash}]"
+        if not self._send_encrypted_private_message(header, destination_id):
+            print("[ERROR] Failed to send file header")
+            return False
+        
+        # Send chunks
+        for chunk_num in range(total_chunks):
+            start = chunk_num * chunk_size
+            end = start + chunk_size
+            chunk_data = file_base64[start:end]
+            
+            # Send chunk with metadata
+            chunk_message = f"[FILECHUNK:{file_id}:{chunk_num}:{total_chunks}:{chunk_data}]"
+            if not self._send_encrypted_private_message(chunk_message, destination_id):
+                print(f"[ERROR] Failed to send chunk {chunk_num + 1}/{total_chunks}")
+                return False
+            
+            # Small delay between chunks to avoid overwhelming the network
+            time.sleep(0.1)
+        
+        print(f"[OK] File '{filename}' sent successfully ({total_chunks} chunks)")
+        return True
+    
+    def _handle_file_chunk(self, text: str, from_id: str, from_name: str) -> bool:
+        """Handle incoming file chunk or header
+        
+        Returns:
+            True if this was a file message (handled), False otherwise
+        """
+        # Check for file header
+        if text.startswith("[FILE:"):
+            try:
+                # Parse: [FILE:file_id:filename:total_chunks:hash]
+                # Filename might contain colons, so parse from the end
+                if text.endswith(']'):
+                    content = text[6:-1]  # Remove [FILE: and ]
+                    # Find the last 3 colons (for total_chunks, file_hash, and end)
+                    last_colon_idx = content.rfind(':')
+                    if last_colon_idx == -1:
+                        return False
+                    file_hash = content[last_colon_idx+1:]
+                    content = content[:last_colon_idx]
+                    
+                    second_last_colon_idx = content.rfind(':')
+                    if second_last_colon_idx == -1:
+                        return False
+                    try:
+                        total_chunks = int(content[second_last_colon_idx+1:])
+                    except ValueError:
+                        return False
+                    content = content[:second_last_colon_idx]
+                    
+                    first_colon_idx = content.find(':')
+                    if first_colon_idx == -1:
+                        return False
+                    file_id = content[:first_colon_idx]
+                    filename = content[first_colon_idx+1:]
+                    
+                    if file_id and filename and total_chunks > 0 and file_hash:
+                        # Initialize file transfer
+                        self.file_transfers[file_id] = {
+                            'filename': filename,
+                            'total_chunks': total_chunks,
+                            'received_chunks': {},
+                            'from_id': from_id,
+                            'from_name': from_name,
+                            'file_hash': file_hash,
+                            'timestamp': datetime.now().isoformat()
+                        }
+                        
+                        print(f"\n[FILE] Receiving file '{filename}' from {from_name} ({from_id}) - {total_chunks} chunks")
+                        return True
+            except Exception as e:
+                print(f"[ERROR] Failed to parse file header: {e}")
+                return False
+        
+        # Check for file chunk
+        elif text.startswith("[FILECHUNK:"):
+            try:
+                # Parse: [FILECHUNK:file_id:chunk_num:total_chunks:data]
+                parts = text[11:-1].split(':')  # Remove [FILECHUNK: and ]
+                if len(parts) >= 4:
+                    file_id = parts[0]
+                    chunk_num = int(parts[1])
+                    total_chunks = int(parts[2])
+                    chunk_data = ':'.join(parts[3:])  # Rejoin in case data contains ':'
+                    
+                    # Check if we have this file transfer
+                    if file_id not in self.file_transfers:
+                        print(f"[WARN] Received chunk for unknown file: {file_id}")
+                        return True  # Still handled, just ignored
+                    
+                    transfer = self.file_transfers[file_id]
+                    
+                    # Store chunk
+                    transfer['received_chunks'][chunk_num] = chunk_data
+                    
+                    # Check if all chunks received
+                    if len(transfer['received_chunks']) == transfer['total_chunks']:
+                        # Reassemble file
+                        self._reassemble_file(file_id)
+                    
+                    return True
+            except Exception as e:
+                print(f"[ERROR] Failed to parse file chunk: {e}")
+                return False
+        
+        return False
+    
+    def _reassemble_file(self, file_id: str):
+        """Reassemble a file from received chunks"""
+        if file_id not in self.file_transfers:
+            return
+        
+        transfer = self.file_transfers[file_id]
+        filename = transfer['filename']
+        total_chunks = transfer['total_chunks']
+        received_chunks = transfer['received_chunks']
+        file_hash = transfer['file_hash']
+        from_name = transfer['from_name']
+        
+        # Check if we have all chunks
+        if len(received_chunks) != total_chunks:
+            print(f"[ERROR] Missing chunks for file '{filename}': {len(received_chunks)}/{total_chunks}")
+            return
+        
+        # Reassemble base64 string
+        chunks = []
+        for i in range(total_chunks):
+            if i not in received_chunks:
+                print(f"[ERROR] Missing chunk {i} for file '{filename}'")
+                del self.file_transfers[file_id]
+                return
+            chunks.append(received_chunks[i])
+        
+        file_base64 = ''.join(chunks)
+        
+        # Decode from base64
+        try:
+            file_data = base64.b64decode(file_base64)
+        except Exception as e:
+            print(f"[ERROR] Failed to decode file data: {e}")
+            del self.file_transfers[file_id]
+            return
+        
+        # Verify hash
+        calculated_hash = hashlib.sha256(file_data).hexdigest()
+        if calculated_hash != file_hash:
+            print(f"[ERROR] File hash mismatch for '{filename}' - file may be corrupted")
+            del self.file_transfers[file_id]
+            return
+        
+        # Save file
+        # Create downloads directory if it doesn't exist
+        downloads_dir = "downloads"
+        if not os.path.exists(downloads_dir):
+            os.makedirs(downloads_dir)
+        
+        # Add timestamp to filename to avoid overwrites
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name, ext = os.path.splitext(filename)
+        safe_filename = f"{base_name}_{timestamp}{ext}"
+        file_path = os.path.join(downloads_dir, safe_filename)
+        
+        try:
+            with open(file_path, 'wb') as f:
+                f.write(file_data)
+            
+            file_size = len(file_data)
+            print(f"\n[FILE] File '{filename}' received from {from_name} ({file_size} bytes)")
+            print(f"       Saved to: {file_path}")
+            
+            # Clean up
+            del self.file_transfers[file_id]
+        except Exception as e:
+            print(f"[ERROR] Failed to save file: {e}")
+            del self.file_transfers[file_id]
     
     def set_node_name(self, long_name: str, short_name: str) -> bool:
         """Set the node's long and short name"""
@@ -1262,6 +1569,8 @@ class MeshasticClient:
         print("  /reboot   - Reboot the device: /reboot [delay_seconds]")
         print("  /history  - Show message history")
         print("  /broadcast - Send broadcast message: /broadcast <message>")
+        print("  /setkey   - Set encryption key for node: /setkey <node_id_or_name> <password>")
+        print("  /file     - Send file: /file <node_id_or_name> <path_to_file>")
         print("  /clear    - Clear screen")
         print("  /quit     - Exit client")
         print("\nUse commands to send messages. Type /help for available commands.")
@@ -1296,6 +1605,7 @@ class MeshasticClient:
                             print("  /history  - Show message history")
                             print("  /broadcast - Send broadcast message: /broadcast <message>")
                             print("  /setkey   - Set encryption key for node: /setkey <node_id_or_name> <password>")
+                            print("  /file     - Send file: /file <node_id_or_name> <path_to_file>")
                             print("  /clear    - Clear screen")
                             print("  /quit     - Exit client")
                             print()
@@ -1413,6 +1723,19 @@ class MeshasticClient:
                                         print(f"[OK] Encryption key set for node {node_id}")
                                         print("  Private messages with this node will now be encrypted")
                                         print("  Make sure the other party uses the same password!")
+                        elif cmd.startswith('/file '):
+                            # Parse file command: /file <node_id_or_name> <path_to_file>
+                            parts = user_input.split(' ', 2)
+                            if len(parts) < 3:
+                                print("Usage: /file <node_id_or_name> <path_to_file>")
+                                print("Example: /file 1234567890 /path/to/file.txt")
+                                print("Example: /file joker13 document.pdf")
+                                print("Sends a file (up to 512KB) to the specified node.")
+                                print("The file will be encrypted if encryption is enabled for that node.")
+                            else:
+                                node_identifier = parts[1]
+                                file_path = parts[2]
+                                self.send_file(node_identifier, file_path)
                         elif cmd == '/clear':
                             os.system('cls' if os.name == 'nt' else 'clear')
                         else:
