@@ -22,8 +22,10 @@ try:
     import meshtastic
     from meshtastic.serial_interface import SerialInterface
     from meshtastic import portnums_pb2, mesh_pb2
+    from pubsub import pub
 except ImportError:
     print("Error: meshtastic library not found. Install it with: pip install meshtastic")
+    print("Also ensure pubsub is installed: pip install pypubsub")
     sys.exit(1)
 
 # Import serial tools for port listing (meshtastic includes pyserial)
@@ -48,8 +50,6 @@ class MeshasticClient:
         self.running = False
         self.history_file = history_file
         self.message_history: List[Dict] = []
-        self.receive_thread: Optional[threading.Thread] = None
-        self.last_processed_packets = set()  # Track processed packets to avoid duplicates
         
     def load_history(self):
         """Load message history from file"""
@@ -292,91 +292,18 @@ class MeshasticClient:
             print(f"[OK] Connected via serial to device: {device_name}")
             print(f"  Node ID: {node_id}")
             
-            # Get the actual serial port being used
-            if hasattr(self.interface, 'port') and self.interface.port:
-                print(f"  Serial Port: {self.interface.port}")
-            elif hasattr(self.interface, 'stream') and hasattr(self.interface.stream, 'port'):
-                print(f"  Serial Port: {self.interface.stream.port}")
+            # Get and display full port information
+            port_info = self.get_port_info()
+            print(f"  Serial Port: {port_info['full_name']}")
             
-            # Set up message callback - try different API methods
-            # Note: Some versions of meshtastic may not support callbacks
-            # The client will still work for sending messages
-            callback_available = False
+            # Set up message callback using pubsub (like the working example)
             try:
-                # Try subscribe method (most common) - with different signatures
-                if hasattr(self.interface, 'subscribe'):
-                    try:
-                        # Try with callback function
-                        self.interface.subscribe(self.on_receive)
-                        callback_available = True
-                        print("  [OK] Message callbacks enabled via subscribe()")
-                    except TypeError:
-                        # Maybe it needs a different signature
-                        try:
-                            self.interface.subscribe(self.on_receive, portnums_pb2.TEXT_MESSAGE_APP)
-                            callback_available = True
-                            print("  [OK] Message callbacks enabled via subscribe(portnum)")
-                        except Exception as e:
-                            print(f"  [WARN] subscribe() failed: {e}")
-                    except AttributeError:
-                        # Method doesn't exist in this version
-                        pass
-                    except Exception as e:
-                        # Some other error, but connection is still good
-                        print(f"  [WARN] subscribe() failed: {e}")
-                        pass
-                
-                # Try setOnReceive method
-                if not callback_available and hasattr(self.interface, 'setOnReceive'):
-                    try:
-                        self.interface.setOnReceive(self.on_receive)
-                        callback_available = True
-                        print("  [OK] Message callbacks enabled via setOnReceive()")
-                    except Exception as e:
-                        print(f"  [WARN] setOnReceive() failed: {e}")
-                        pass
-                
-                # Try direct assignment
-                if not callback_available and hasattr(self.interface, 'onReceive'):
-                    try:
-                        self.interface.onReceive = self.on_receive
-                        callback_available = True
-                        print("  [OK] Message callbacks enabled via onReceive assignment")
-                    except Exception as e:
-                        print(f"  [WARN] onReceive assignment failed: {e}")
-                        pass
-                
-                # Try subscribeToConnection method (some versions)
-                if not callback_available and hasattr(self.interface, 'subscribeToConnection'):
-                    try:
-                        self.interface.subscribeToConnection(self.on_receive)
-                        callback_available = True
-                        print("  [OK] Message callbacks enabled via subscribeToConnection()")
-                    except Exception as e:
-                        pass
-                
-                # Try using the meshtastic event system
-                if not callback_available and hasattr(meshtastic, 'subscribe'):
-                    try:
-                        meshtastic.subscribe('meshtastic.receive.text', self.on_receive)
-                        callback_available = True
-                        print("  [OK] Message callbacks enabled via meshtastic.subscribe()")
-                    except Exception as e:
-                        pass
+                pub.subscribe(self.on_receive, "meshtastic.receive")
+                print("  [OK] Message callbacks enabled via pubsub")
+                callback_available = True
             except Exception as e:
-                # Any callback setup error is non-fatal
-                print(f"  [WARN] Callback setup error: {e}")
-                pass
-            
-            if not callback_available:
-                print("  [WARN] Real-time message callbacks not available")
-                print("  You can still send messages successfully")
-                print("  Using polling fallback for receiving messages")
-                print("  [TIP] Try updating meshtastic: pip install --upgrade meshtastic")
-                print("  [TIP] Use /check command to manually check for messages")
-            
-            # Start polling thread as fallback
-            self.start_receive_thread()
+                print(f"  [WARN] Failed to set up message callbacks: {e}")
+                callback_available = False
             
             self.running = True
             return True
@@ -445,91 +372,74 @@ class MeshasticClient:
             
             return False
     
-    def on_receive(self, *args, **kwargs):
-        """Callback for received messages - handles different signatures"""
+    def on_receive(self, packet, interface):
+        """Callback for received messages using pubsub"""
         try:
-            # Handle different callback signatures
-            packet = None
-            interface = None
-            
-            if args:
-                packet = args[0]
-                if len(args) > 1:
-                    interface = args[1]
-            
-            if 'packet' in kwargs:
-                packet = kwargs['packet']
-            if 'interface' in kwargs:
-                interface = kwargs['interface']
-            
-            if not packet:
+            # Handle packet in dictionary format (like the working example)
+            if not isinstance(packet, dict):
                 return
             
-            # Handle different packet formats
-            decoded = None
-            if isinstance(packet, dict):
-                decoded = packet.get('decoded')
-            elif hasattr(packet, 'decoded'):
-                decoded = packet.decoded
+            decoded = packet.get('decoded')
+            if not decoded:
+                return
             
-            if decoded:
-                # Check if it's a text message
-                portnum = None
-                if isinstance(decoded, dict):
-                    portnum = decoded.get('portnum')
-                elif hasattr(decoded, 'portnum'):
-                    portnum = decoded.portnum
+            # Check if it's a text message
+            portnum = decoded.get('portnum')
+            
+            # Handle both string and numeric portnum
+            is_text_message = False
+            if portnum == 'TEXT_MESSAGE_APP' or portnum == portnums_pb2.TEXT_MESSAGE_APP or portnum == 1:
+                is_text_message = True
+            
+            if is_text_message:
+                # Extract text from payload (like the working example)
+                text = ''
+                if 'payload' in decoded:
+                    try:
+                        text = decoded['payload'].decode('utf-8')
+                    except (UnicodeDecodeError, AttributeError):
+                        # Try as string if already decoded
+                        text = str(decoded.get('payload', ''))
+                elif 'text' in decoded:
+                    text = decoded['text']
                 
-                # TEXT_MESSAGE_APP is typically 1
-                if portnum == portnums_pb2.TEXT_MESSAGE_APP or portnum == 1:
-                    # Extract text
-                    text = ''
-                    if isinstance(decoded, dict):
-                        text = decoded.get('text', '')
-                    elif hasattr(decoded, 'text'):
-                        text = decoded.text
-                    
+                if text:
                     # Extract sender info
-                    from_id = 'Unknown'
+                    from_id = packet.get('fromId', 'Unknown')
                     from_name = 'Unknown'
-                    if isinstance(packet, dict):
-                        from_id = packet.get('fromId', packet.get('from', 'Unknown'))
-                        # Try to get sender name from nodes
-                        if self.interface and hasattr(self.interface, 'nodes'):
-                            nodes = self.interface.nodes
-                            if from_id in nodes:
-                                user = nodes[from_id].get('user', {})
-                                from_name = user.get('longName', user.get('shortName', str(from_id)))
-                            else:
-                                from_name = str(from_id)
-                    elif hasattr(packet, 'fromId'):
-                        from_id = packet.fromId
+                    
+                    # Try to get sender name from nodes
+                    if self.interface and hasattr(self.interface, 'nodes'):
+                        nodes = self.interface.nodes
+                        if from_id in nodes:
+                            user = nodes[from_id].get('user', {})
+                            from_name = user.get('longName', user.get('shortName', str(from_id)))
+                        else:
+                            from_name = str(from_id)
+                    else:
                         from_name = str(from_id)
                     
-                    if text:
-                        timestamp = datetime.now().isoformat()
+                    timestamp = datetime.now().isoformat()
+                    
+                    message = {
+                        'timestamp': timestamp,
+                        'from_id': str(from_id),
+                        'from_name': from_name,
+                        'text': text
+                    }
+                    
+                    # Check if we've already seen this message (avoid duplicates)
+                    if not self._is_duplicate_message(message):
+                        self.add_to_history(message)
                         
-                        message = {
-                            'timestamp': timestamp,
-                            'from_id': str(from_id),
-                            'from_name': from_name,
-                            'text': text
-                        }
-                        
-                        # Check if we've already seen this message (avoid duplicates)
-                        if not self._is_duplicate_message(message):
-                            self.add_to_history(message)
-                            
-                            # Display message
-                            print(f"\n[{timestamp}] {from_name} ({from_id}): {text}")
-                            print("> ", end='', flush=True)
+                        # Display message
+                        print(f"\n[{timestamp}] {from_name} ({from_id}): {text}")
+                        print("> ", end='', flush=True)
+        except KeyError:
+            # Ignore KeyError silently (like the working example)
+            pass
         except Exception as e:
-            # Silently handle errors to avoid disrupting the interface
-            # Uncomment for debugging:
-            # import traceback
-            # print(f"\n[DEBUG] Error in on_receive: {e}")
-            # print(f"[DEBUG] Packet type: {type(packet)}")
-            # traceback.print_exc()
+            # Silently handle other errors
             pass
     
     def _is_duplicate_message(self, message: Dict) -> bool:
@@ -545,108 +455,7 @@ class MeshasticClient:
                 return True
         return False
     
-    def start_receive_thread(self):
-        """Start background thread for receiving messages via polling"""
-        if self.receive_thread and self.receive_thread.is_alive():
-            return
-        
-        def poll_messages():
-            """Poll for messages by checking interface state and manually processing packets"""
-            while self.running:
-                try:
-                    if self.interface:
-                        # Method 1: Check if interface has a receive queue or buffer
-                        if hasattr(self.interface, 'receiveQueue'):
-                            try:
-                                queue = self.interface.receiveQueue
-                                while not queue.empty():
-                                    packet = queue.get_nowait()
-                                    self.on_receive(packet, self.interface)
-                            except Exception:
-                                pass
-                        
-                        # Method 2: Check if interface stores received packets
-                        if hasattr(self.interface, 'receivedPackets'):
-                            try:
-                                packets = self.interface.receivedPackets
-                                if packets:
-                                    for packet in packets:
-                                        # Create a unique ID for this packet to avoid duplicates
-                                        packet_id = id(packet)
-                                        if packet_id not in self.last_processed_packets:
-                                            self.last_processed_packets.add(packet_id)
-                                            # Keep only last 100 packet IDs
-                                            if len(self.last_processed_packets) > 100:
-                                                self.last_processed_packets = set(list(self.last_processed_packets)[-100:])
-                                            self.on_receive(packet, self.interface)
-                            except Exception:
-                                pass
-                        
-                        # Method 3: Try to manually read and process from stream
-                        # This is a last resort - try to read raw data and let interface process it
-                        if hasattr(self.interface, 'stream'):
-                            try:
-                                stream = self.interface.stream
-                                # Check if there's data waiting
-                                if hasattr(stream, 'in_waiting') and stream.in_waiting > 0:
-                                    # Data is available - the interface should process it automatically
-                                    # But we can try to trigger processing by accessing the interface
-                                    # Some versions need the interface to be "touched" to process
-                                    if hasattr(self.interface, 'noProto'):
-                                        _ = self.interface.noProto  # Access to trigger processing
-                            except Exception:
-                                pass
-                        
-                        # Method 4: Try to access the interface's packet handler directly
-                        # Some versions process packets in a background thread
-                        # We can try to manually check for new packets
-                        if hasattr(self.interface, '_rxQueue'):
-                            try:
-                                queue = self.interface._rxQueue
-                                while not queue.empty():
-                                    packet = queue.get_nowait()
-                                    self.on_receive(packet, self.interface)
-                            except Exception:
-                                pass
-                    
-                    time.sleep(0.3)  # Poll every 0.3 seconds for better responsiveness
-                except Exception as e:
-                    # Ignore errors in polling thread
-                    time.sleep(0.3)
-        
-        self.receive_thread = threading.Thread(target=poll_messages, daemon=True)
-        self.receive_thread.start()
     
-    def check_for_messages(self):
-        """Manually check for new messages by examining interface state"""
-        if not self.interface:
-            print("[ERROR] Not connected to device")
-            return
-        
-        try:
-            # Try to access any internal message storage
-            found_new = False
-            
-            # Method 1: Check if interface has a way to get recent messages
-            if hasattr(self.interface, 'getMyNodeInfo'):
-                # Sometimes messages are stored in node info
-                node_info = self.interface.getMyNodeInfo()
-                # This usually doesn't contain messages, but worth checking
-            
-            # Method 2: Try to manually read from stream and process
-            if hasattr(self.interface, 'stream'):
-                stream = self.interface.stream
-                if hasattr(stream, 'in_waiting') and stream.in_waiting > 0:
-                    # There's data waiting - try to trigger processing
-                    # The interface should process it automatically
-                    print("  [INFO] Data available on stream, interface should process automatically")
-                    found_new = True
-            
-            if not found_new:
-                print("  [INFO] No new messages detected. Messages should appear automatically when received.")
-                print("  [INFO] If messages aren't appearing, the callback may not be working with this meshtastic version.")
-        except Exception as e:
-            print(f"  [ERROR] Error checking for messages: {e}")
     
     def _process_message_dict(self, msg: Dict):
         """Process a message dictionary"""
@@ -748,16 +557,65 @@ class MeshasticClient:
             print(f"[ERROR] Failed to send message: {e}")
             return False
     
-    def send_private_message(self, node_id: str, text: str) -> bool:
-        """Send a private message to a specific node"""
+    def send_private_message(self, node_identifier: str, text: str) -> bool:
+        """Send a private message to a specific node by ID or exact name match
+        
+        Args:
+            node_identifier: Node ID (number) or exact node name (long name or short name)
+            text: Message text to send
+        """
+        # First, try to parse as a node ID (number)
         try:
-            # Try to convert node_id to integer
-            destination_id = int(node_id)
+            destination_id = int(node_identifier)
             return self.send_message(text, destination_id=destination_id)
         except ValueError:
-            print(f"[ERROR] Invalid node ID: {node_id}. Node ID must be a number.")
-            print("  Use /nodes to see available node IDs")
+            # Not a number, try to resolve as exact name match
+            pass
+        
+        # Try to find exact name match (case-insensitive)
+        nodes = self.get_node_info()
+        if not nodes:
+            print("[ERROR] No node information available")
             return False
+        
+        node_identifier_lower = node_identifier.lower()
+        matches = []
+        
+        for node_id, node in nodes.items():
+            num = node.get('num', node_id)
+            user = node.get('user', {})
+            long_name = user.get('longName', '')
+            short_name = user.get('shortName', '')
+            
+            # Check for exact match (case-insensitive) against long name or short name
+            if (long_name and long_name.lower() == node_identifier_lower) or \
+               (short_name and short_name.lower() == node_identifier_lower):
+                matches.append((num, long_name, short_name))
+        
+        if not matches:
+            print(f"[ERROR] No nodes found with exact name: {node_identifier}")
+            print("  Use /nodes to see available nodes")
+            print("  Use /resolve <pattern> to find nodes by name pattern")
+            return False
+        
+        if len(matches) > 1:
+            print(f"[ERROR] Multiple nodes found with name '{node_identifier}':")
+            for node_id, long_name, short_name in matches:
+                name_display = long_name if long_name else short_name
+                if not name_display:
+                    name_display = f"Node {node_id}"
+                print(f"  Node ID: {node_id} - {name_display} ({short_name if short_name else 'N/A'})")
+            print("  Please use the node ID directly to avoid ambiguity")
+            return False
+        
+        # Single match - send the message
+        node_id, long_name, short_name = matches[0]
+        name_display = long_name if long_name else short_name
+        if not name_display:
+            name_display = f"Node {node_id}"
+        
+        print(f"[INFO] Sending to {name_display} (Node ID: {node_id})")
+        return self.send_message(text, destination_id=node_id)
     
     def set_node_name(self, long_name: str, short_name: str) -> bool:
         """Set the node's long and short name"""
@@ -834,22 +692,38 @@ class MeshasticClient:
             print(f"Error getting node info: {e}")
             return {}
     
-    def print_node_data(self, data, indent=0, prefix=""):
-        """Recursively print all node data"""
-        indent_str = "  " * indent
-        if isinstance(data, dict):
-            for key, value in data.items():
-                if isinstance(value, (dict, list)):
-                    print(f"{indent_str}{prefix}{key}:")
-                    self.print_node_data(value, indent + 1)
-                else:
-                    print(f"{indent_str}{prefix}{key}: {value}")
-        elif isinstance(data, list):
-            for i, item in enumerate(data):
-                print(f"{indent_str}{prefix}[{i}]:")
-                self.print_node_data(item, indent + 1)
-        else:
-            print(f"{indent_str}{prefix}{data}")
+    def format_timestamp(self, timestamp: int) -> str:
+        """Convert Unix timestamp to human readable format"""
+        try:
+            dt = datetime.fromtimestamp(timestamp)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OSError, TypeError):
+            return str(timestamp)
+    
+    def format_position(self, position: Dict) -> str:
+        """Format position and generate Google Maps URL"""
+        if not position:
+            return "N/A"
+        
+        lat = position.get('latitude')
+        lon = position.get('longitude')
+        
+        if lat is not None and lon is not None:
+            # Generate Google Maps URL
+            url = f"https://www.google.com/maps?q={lat},{lon}"
+            return f"{lat}, {lon} ({url})"
+        
+        # Fallback to integer coordinates if available
+        lat_i = position.get('latitudeI')
+        lon_i = position.get('longitudeI')
+        if lat_i is not None and lon_i is not None:
+            # Convert from integer format (divide by 1e7)
+            lat = lat_i / 1e7
+            lon = lon_i / 1e7
+            url = f"https://www.google.com/maps?q={lat},{lon}"
+            return f"{lat}, {lon} ({url})"
+        
+        return "N/A"
     
     def resolve_node_name(self, pattern: str) -> List[tuple]:
         """Resolve node names (with wildcards) to node IDs
@@ -963,6 +837,60 @@ class MeshasticClient:
         except Exception:
             return None
     
+    def get_port_info(self) -> Dict[str, str]:
+        """Get full port information including name and description
+        
+        Returns:
+            Dictionary with 'port', 'description', 'manufacturer', and 'full_name'
+        """
+        port_info = {
+            'port': 'Unknown',
+            'description': '',
+            'manufacturer': '',
+            'full_name': 'Unknown'
+        }
+        
+        if not self.interface:
+            return port_info
+        
+        # Get the port name
+        port_name = None
+        if hasattr(self.interface, 'port') and self.interface.port:
+            port_name = self.interface.port
+        elif hasattr(self.interface, 'stream') and hasattr(self.interface.stream, 'port'):
+            port_name = self.interface.stream.port
+        elif hasattr(self.interface, 'devPath'):
+            port_name = self.interface.devPath
+        
+        if port_name:
+            port_info['port'] = port_name
+            
+            # Try to get full port information from serial port listing
+            if list_ports:
+                try:
+                    ports = list_ports.comports()
+                    for port in ports:
+                        if port.device == port_name:
+                            port_info['description'] = port.description or ''
+                            port_info['manufacturer'] = port.manufacturer or ''
+                            
+                            # Build full name
+                            parts = [port_name]
+                            if port.description:
+                                parts.append(port.description)
+                            if port.manufacturer:
+                                parts.append(f"({port.manufacturer})")
+                            
+                            port_info['full_name'] = ' - '.join(parts)
+                            break
+                except Exception:
+                    # If we can't get detailed info, just use the port name
+                    port_info['full_name'] = port_name
+            else:
+                port_info['full_name'] = port_name
+        
+        return port_info
+    
     def show_nodes(self, pattern: Optional[str] = None):
         """Display connected nodes with all available information
         
@@ -1011,7 +939,24 @@ class MeshasticClient:
         print("  (Use /pm <node_id> <message> to send private message)")
         print()
         
-        for node_id, node in nodes.items():
+        # Sort nodes: first by hops away (ascending), then by lastHeard (descending - most recent first)
+        def sort_key(item):
+            node_id, node = item
+            # Get hops away (use a large number if not available, so they sort last)
+            hop_count = self.get_hop_count(node)
+            hops = hop_count if hop_count is not None else 999
+            
+            # Get lastHeard (use 0 if not available, so they sort last)
+            last_heard = node.get('lastHeard', 0)
+            
+            # Return tuple: (hops, -lastHeard) 
+            # Negative lastHeard because we want descending order (most recent first)
+            return (hops, -last_heard)
+        
+        # Sort the nodes
+        sorted_nodes = sorted(nodes.items(), key=sort_key)
+        
+        for node_id, node in sorted_nodes:
             num = node.get('num', node_id)
             user = node.get('user', {})
             long_name = user.get('longName', 'Unknown')
@@ -1030,8 +975,55 @@ class MeshasticClient:
             print(f"--- Node ID: {num} ({long_name} / {short_name}){current_marker}{hop_info} ---")
             print()
             
-            # Print all available node information
-            self.print_node_data(node, indent=0)
+            # Display specific fields in simplified format
+            user = node.get('user', {})
+            position = node.get('position', {})
+            
+            # id
+            if 'id' in user:
+                print(f"id: {user['id']}")
+            
+            # longName
+            if long_name and long_name != 'Unknown':
+                print(f"longName: {long_name}")
+            
+            # shortName
+            if short_name and short_name != 'Unknown':
+                print(f"shortName: {short_name}")
+            
+            # hopsAway
+            hop_count = self.get_hop_count(node)
+            if hop_count is not None:
+                print(f"hopsAway: {hop_count}")
+            
+            # macaddr
+            if 'macaddr' in user:
+                print(f"macaddr: {user['macaddr']}")
+            
+            # hwModel
+            if 'hwModel' in node:
+                print(f"hwModel: {node['hwModel']}")
+            
+            # snr
+            if 'snr' in node:
+                print(f"snr: {node['snr']}")
+            
+            # lastHeard (convert to human readable)
+            if 'lastHeard' in node:
+                last_heard = node['lastHeard']
+                readable_time = self.format_timestamp(last_heard)
+                print(f"lastHeard: {readable_time}")
+            
+            # uptimeSeconds
+            device_metrics = node.get('deviceMetrics', {})
+            if 'uptimeSeconds' in device_metrics:
+                print(f"uptimeSeconds: {device_metrics['uptimeSeconds']}")
+            
+            # position (with Google Maps URL)
+            if position:
+                pos_str = self.format_position(position)
+                print(f"position: {pos_str}")
+            
             print()
     
     def show_history(self, limit: int = 20):
@@ -1054,282 +1046,6 @@ class MeshasticClient:
                 print(f"[{timestamp}] {from_name}: {text}")
         print()
     
-    def get_region(self) -> Optional[str]:
-        """Get the current device region
-        
-        Returns:
-            Region name as string if available, None otherwise
-        """
-        if not self.interface:
-            return None
-        
-        try:
-            # Method 1: Try using getPref (most common method)
-            if hasattr(self.interface, 'getPref'):
-                try:
-                    region = self.interface.getPref('lora.region')
-                    if region is not None:
-                        region_names = {
-                            0: "UNSET",
-                            1: "US",
-                            2: "EU_433",
-                            3: "EU_868",
-                            4: "CN",
-                            5: "JP",
-                            6: "ANZ",
-                            7: "KR",
-                            8: "TW",
-                            9: "RU",
-                            10: "IN",
-                            11: "NZ_865",
-                            12: "TH",
-                            13: "LORA_24",
-                            14: "UA_433",
-                            15: "UA_868",
-                            16: "MY_433",
-                            17: "MY_919",
-                            18: "SG_923",
-                        }
-                        return region_names.get(region, f"UNKNOWN({region})")
-                except Exception:
-                    pass
-            
-            # Method 2: Try using localNode.getPref
-            if hasattr(self.interface, 'localNode'):
-                local_node = self.interface.localNode
-                if hasattr(local_node, 'getPref'):
-                    try:
-                        region = local_node.getPref('lora.region')
-                        if region is not None:
-                            region_names = {
-                                0: "UNSET",
-                                1: "US",
-                                2: "EU_433",
-                                3: "EU_868",
-                                4: "CN",
-                                5: "JP",
-                                6: "ANZ",
-                                7: "KR",
-                                8: "TW",
-                                9: "RU",
-                                10: "IN",
-                                11: "NZ_865",
-                                12: "TH",
-                                13: "LORA_24",
-                                14: "UA_433",
-                                15: "UA_868",
-                                16: "MY_433",
-                                17: "MY_919",
-                                18: "SG_923",
-                            }
-                            return region_names.get(region, f"UNKNOWN({region})")
-                    except Exception:
-                        pass
-            
-            # Method 3: Try to get region from radio config
-            if hasattr(self.interface, 'radioConfig'):
-                radio_config = self.interface.radioConfig
-                if hasattr(radio_config, 'preferences'):
-                    prefs = radio_config.preferences
-                    if hasattr(prefs, 'lora') and hasattr(prefs.lora, 'region'):
-                        region = prefs.lora.region
-                        # Convert region enum to string
-                        if region is not None:
-                            region_names = {
-                                0: "UNSET",
-                                1: "US",
-                                2: "EU_433",
-                                3: "EU_868",
-                                4: "CN",
-                                5: "JP",
-                                6: "ANZ",
-                                7: "KR",
-                                8: "TW",
-                                9: "RU",
-                                10: "IN",
-                                11: "NZ_865",
-                                12: "TH",
-                                13: "LORA_24",
-                                14: "UA_433",
-                                15: "UA_868",
-                                16: "MY_433",
-                                17: "MY_919",
-                                18: "SG_923",
-                            }
-                            return region_names.get(region, f"UNKNOWN({region})")
-            
-            # Method 4: Try alternative method - check in node info
-            node_info = self.interface.getMyNodeInfo()
-            radio = node_info.get('radio', {})
-            if isinstance(radio, dict) and 'region' in radio:
-                region = radio.get('region')
-                if region is not None:
-                    region_names = {
-                        0: "UNSET",
-                        1: "US",
-                        2: "EU_433",
-                        3: "EU_868",
-                        4: "CN",
-                        5: "JP",
-                        6: "ANZ",
-                        7: "KR",
-                        8: "TW",
-                        9: "RU",
-                        10: "IN",
-                        11: "NZ_865",
-                        12: "TH",
-                        13: "LORA_24",
-                        14: "UA_433",
-                        15: "UA_868",
-                        16: "MY_433",
-                        17: "MY_919",
-                        18: "SG_923",
-                    }
-                    return region_names.get(region, f"UNKNOWN({region})")
-            
-            return None
-        except Exception:
-            return None
-    
-    def set_region(self, region_name: str) -> bool:
-        """Set the device region
-        
-        Args:
-            region_name: Region name (e.g., 'US', 'EU_433', 'EU_868', 'CN', 'JP', etc.)
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        if not self.interface:
-            print("[ERROR] Not connected to device")
-            return False
-        
-        # Map region names to enum values
-        region_map = {
-            'UNSET': 0,
-            'US': 1,
-            'EU_433': 2,
-            'EU_868': 3,
-            'CN': 4,
-            'JP': 5,
-            'ANZ': 6,
-            'KR': 7,
-            'TW': 8,
-            'RU': 9,
-            'IN': 10,
-            'NZ_865': 11,
-            'TH': 12,
-            'LORA_24': 13,
-            'UA_433': 14,
-            'UA_868': 15,
-            'MY_433': 16,
-            'MY_919': 17,
-            'SG_923': 18,
-        }
-        
-        region_upper = region_name.upper()
-        if region_upper not in region_map:
-            print(f"[ERROR] Invalid region: {region_name}")
-            print("  Valid regions: US, EU_433, EU_868, CN, JP, ANZ, KR, TW, RU, IN, NZ_865, TH, LORA_24, UA_433, UA_868, MY_433, MY_919, SG_923")
-            return False
-        
-        try:
-            region_value = region_map[region_upper]
-            
-            # Method 1: Try using set (CLI method) - accepts string or numeric value
-            if hasattr(self.interface, 'set'):
-                try:
-                    # Try with string first (as CLI does)
-                    self.interface.set('lora.region', region_upper)
-                    print(f"[OK] Region set to: {region_name}")
-                    print("  Note: Device may need to reboot for changes to take full effect")
-                    return True
-                except Exception:
-                    try:
-                        # Fallback to numeric value
-                        self.interface.set('lora.region', region_value)
-                        print(f"[OK] Region set to: {region_name}")
-                        print("  Note: Device may need to reboot for changes to take full effect")
-                        return True
-                    except Exception:
-                        pass
-            
-            # Method 2: Try using setPref (most common method)
-            if hasattr(self.interface, 'setPref'):
-                try:
-                    self.interface.setPref('lora.region', region_value)
-                    print(f"[OK] Region set to: {region_name}")
-                    print("  Note: Device may need to reboot for changes to take full effect")
-                    return True
-                except Exception as e:
-                    # If setPref doesn't work, try other methods
-                    pass
-            
-            # Method 3: Try using localNode.setPref
-            if hasattr(self.interface, 'localNode'):
-                local_node = self.interface.localNode
-                if hasattr(local_node, 'setPref'):
-                    try:
-                        local_node.setPref('lora.region', region_value)
-                        print(f"[OK] Region set to: {region_name}")
-                        print("  Note: Device may need to reboot for changes to take full effect")
-                        return True
-                    except Exception as e:
-                        pass
-            
-            # Method 4: Try using setRadioConfig with localNode
-            if hasattr(self.interface, 'localNode'):
-                local_node = self.interface.localNode
-                if hasattr(local_node, 'setRadioConfig'):
-                    try:
-                        from meshtastic import mesh_pb2
-                        config = mesh_pb2.Config()
-                        config.lora.region = region_value
-                        local_node.setRadioConfig(config)
-                        print(f"[OK] Region set to: {region_name}")
-                        print("  Note: Device may need to reboot for changes to take full effect")
-                        return True
-                    except Exception as e:
-                        pass
-            
-            # Method 5: Try to set region via radio config
-            if hasattr(self.interface, 'radioConfig'):
-                radio_config = self.interface.radioConfig
-                if hasattr(radio_config, 'preferences'):
-                    prefs = radio_config.preferences
-                    if hasattr(prefs, 'lora'):
-                        if hasattr(prefs.lora, 'region'):
-                            prefs.lora.region = region_value
-                            
-                            # Write the configuration
-                            if hasattr(self.interface, 'writeConfig'):
-                                try:
-                                    self.interface.writeConfig()
-                                    print(f"[OK] Region set to: {region_name}")
-                                    print("  Note: Device may need to reboot for changes to take full effect")
-                                    return True
-                                except Exception as e:
-                                    pass
-                            elif hasattr(self.interface, 'localNode') and hasattr(self.interface.localNode, 'writeConfig'):
-                                try:
-                                    self.interface.localNode.writeConfig()
-                                    print(f"[OK] Region set to: {region_name}")
-                                    print("  Note: Device may need to reboot for changes to take full effect")
-                                    return True
-                                except Exception as e:
-                                    pass
-            
-            # If all methods failed
-            print("[ERROR] Cannot set region - API not available in this meshtastic version")
-            print("  Tried methods: set, setPref, localNode.setPref, setRadioConfig, writeConfig")
-            print("  You may need to update the meshtastic library: pip install --upgrade meshtastic")
-            print("  Or use the meshtastic CLI: meshtastic --set lora.region US")
-            return False
-            
-        except Exception as e:
-            print(f"[ERROR] Failed to set region: {e}")
-            return False
-    
     def show_status(self):
         """Display device status"""
         if not self.interface:
@@ -1340,19 +1056,19 @@ class MeshasticClient:
             node_info = self.interface.getMyNodeInfo()
             print("\n=== Device Status ===")
             print(f"Connection Type: Serial")
-            if hasattr(self.interface, 'port') and self.interface.port:
-                print(f"Serial Port: {self.interface.port}")
+            
+            # Get and display full port information
+            port_info = self.get_port_info()
+            print(f"Serial Port: {port_info['full_name']}")
+            if port_info['description']:
+                print(f"  Description: {port_info['description']}")
+            if port_info['manufacturer']:
+                print(f"  Manufacturer: {port_info['manufacturer']}")
+            
             print(f"Node ID: {node_info.get('num', 'Unknown')}")
             user = node_info.get('user', {})
             print(f"Long Name: {user.get('longName', 'Unknown')}")
             print(f"Short Name: {user.get('shortName', 'Unknown')}")
-            
-            # Get and display region
-            region = self.get_region()
-            if region:
-                print(f"Region: {region}")
-            else:
-                print("Region: Not set or unavailable")
             
             # Get radio config
             radio = node_info.get('radio', {})
@@ -1374,20 +1090,19 @@ class MeshasticClient:
         print("  /help     - Show this help")
         print("  /status   - Show device status")
         print("  /nodes    - List connected nodes: /nodes [pattern] (supports wildcards)")
-        print("  /pm       - Send private message: /pm <node_id> <message>")
+        print("  /pm       - Send private message: /pm <node_id_or_name> <message>")
         print("  /resolve  - Resolve name to node ID: /resolve <pattern> (supports wildcards)")
         print("  /setname  - Set node name: /setname <long_name> <short_name>")
-        print("  /setregion - Set device region: /setregion <region> (e.g., US, EU_433, EU_868)")
         print("  /reboot   - Reboot the device: /reboot [delay_seconds]")
         print("  /history  - Show message history")
-        print("  /check    - Manually check for new messages")
+        print("  /broadcast - Send broadcast message: /broadcast <message>")
         print("  /clear    - Clear screen")
         print("  /quit     - Exit client")
-        print("\nType a message to send (broadcast), or use commands above.")
-        print("Use /pm <node_id> <message> to send a private message.")
+        print("\nUse commands to send messages. Type /help for available commands.")
+        print("Use /pm <node_id_or_name> <message> to send a private message (exact name match).")
+        print("Use /broadcast <message> to send a broadcast message to all nodes.")
         print("Use /resolve <pattern> to find node IDs by name (e.g., /resolve *my_node*).")
         print("Use /setname <long_name> <short_name> to change your node name.")
-        print("Use /setregion <region> to set device region (e.g., /setregion US).")
         print("Use /reboot [delay] to reboot the device (default: 10 seconds).\n")
         
         try:
@@ -1408,13 +1123,12 @@ class MeshasticClient:
                             print("  /help     - Show this help")
                             print("  /status   - Show device status")
                             print("  /nodes    - List connected nodes: /nodes [pattern] (supports wildcards)")
-                            print("  /pm       - Send private message: /pm <node_id> <message>")
+                            print("  /pm       - Send private message: /pm <node_id_or_name> <message>")
                             print("  /resolve  - Resolve name to node ID: /resolve <pattern> (supports wildcards)")
                             print("  /setname  - Set node name: /setname <long_name> <short_name>")
-                            print("  /setregion - Set device region: /setregion <region> (e.g., US, EU_433, EU_868)")
                             print("  /reboot   - Reboot the device: /reboot [delay_seconds]")
                             print("  /history  - Show message history")
-                            print("  /check    - Manually check for new messages")
+                            print("  /broadcast - Send broadcast message: /broadcast <message>")
                             print("  /clear    - Clear screen")
                             print("  /quit     - Exit client")
                             print()
@@ -1426,17 +1140,18 @@ class MeshasticClient:
                             pattern = parts[1] if len(parts) > 1 else None
                             self.show_nodes(pattern=pattern)
                         elif cmd.startswith('/pm ') or cmd.startswith('/private '):
-                            # Parse private message command: /pm <node_id> <message>
+                            # Parse private message command: /pm <node_id_or_name> <message>
                             parts = user_input.split(' ', 2)
                             if len(parts) < 3:
-                                print("Usage: /pm <node_id> <message>")
+                                print("Usage: /pm <node_id_or_name> <message>")
                                 print("Example: /pm 1234567890 Hello there!")
-                                print("Use /nodes to see available node IDs")
-                                print("Use /resolve <pattern> to find node IDs by name")
+                                print("Example: /pm joker13 Hello there!  (exact name match)")
+                                print("Use /nodes to see available nodes")
+                                print("Use /resolve <pattern> to find nodes by name pattern")
                             else:
-                                node_id = parts[1]
+                                node_identifier = parts[1]
                                 message = parts[2]
-                                self.send_private_message(node_id, message)
+                                self.send_private_message(node_identifier, message)
                         elif cmd.startswith('/resolve '):
                             # Parse resolve command: /resolve <pattern>
                             parts = user_input.split(' ', 1)
@@ -1460,17 +1175,6 @@ class MeshasticClient:
                                 long_name = parts[1]
                                 short_name = parts[2]
                                 self.set_node_name(long_name, short_name)
-                        elif cmd.startswith('/setregion '):
-                            # Parse setregion command: /setregion <region>
-                            parts = user_input.split(' ', 1)
-                            if len(parts) < 2:
-                                print("Usage: /setregion <region>")
-                                print("Example: /setregion US")
-                                print("Example: /setregion EU_433")
-                                print("Valid regions: US, EU_433, EU_868, CN, JP, ANZ, KR, TW, RU, IN, NZ_865, TH, LORA_24, UA_433, UA_868, MY_433, MY_919, SG_923")
-                            else:
-                                region = parts[1]
-                                self.set_region(region)
                         elif cmd.startswith('/reboot'):
                             # Parse reboot command: /reboot [delay_seconds]
                             parts = user_input.split()
@@ -1496,16 +1200,25 @@ class MeshasticClient:
                                 print("Reboot cancelled.")
                         elif cmd == '/history':
                             self.show_history()
-                        elif cmd == '/check' or cmd == '/refresh':
-                            # Manually check for new messages
-                            self.check_for_messages()
+                        elif cmd.startswith('/broadcast ') or cmd.startswith('/bc '):
+                            # Parse broadcast command: /broadcast <message>
+                            parts = user_input.split(' ', 1)
+                            if len(parts) < 2:
+                                print("Usage: /broadcast <message>")
+                                print("Example: /broadcast Hello everyone!")
+                                print("Sends a message to all nodes in the mesh network.")
+                            else:
+                                message = parts[1]
+                                self.send_message(message, skip_confirmation=True)
                         elif cmd == '/clear':
                             os.system('cls' if os.name == 'nt' else 'clear')
                         else:
                             print(f"Unknown command: {user_input}. Type /help for help.")
                     else:
-                        # Send message
-                        self.send_message(user_input)
+                        # Don't send messages by default - require explicit command
+                        print(f"Unknown command or message. Type /help for available commands.")
+                        print("Use /broadcast <message> to send a broadcast message.")
+                        print("Use /pm <node_id_or_name> <message> to send a private message (exact name match).")
                 
                 except KeyboardInterrupt:
                     print("\nInterrupted. Use /quit to exit.")
