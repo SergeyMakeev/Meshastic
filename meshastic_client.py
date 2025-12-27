@@ -70,6 +70,8 @@ class MeshasticClient:
         self.load_encryption_keys()
         # File transfer state: file_id -> {filename, total_chunks, received_chunks: {chunk_num: data}, from_id, from_name}
         self.file_transfers: Dict[str, Dict] = {}
+        # Long message transfer state: message_id -> {total_chunks, received_chunks: {chunk_num: data}, from_id, from_name, is_encrypted}
+        self.message_transfers: Dict[str, Dict] = {}
         
     def load_history(self):
         """Load message history from file"""
@@ -588,6 +590,12 @@ class MeshasticClient:
                         print("> ", end='', flush=True)
                         return  # Exit early, file message already handled
                     
+                    # Check if this is a long message chunk
+                    if self._handle_message_chunk(decrypted_text, str(node_id_for_key), from_name):
+                        # Long message chunk handled, don't display as regular message
+                        print("> ", end='', flush=True)
+                        return  # Exit early, message chunk already handled
+                    
                     timestamp = datetime.now().isoformat()
                     
                     message = {
@@ -684,6 +692,9 @@ class MeshasticClient:
             message_to_send = self.encrypt_message(text, str(destination_id))
             is_encrypted = message_to_send != text
             
+            # Check message size
+            message_size = len(message_to_send.encode('utf-8'))
+            
             # Private message - use wantAck=True to ensure delivery
             # Try different API formats for compatibility
             try:
@@ -701,10 +712,26 @@ class MeshasticClient:
                         self.interface.sendData(message_to_send.encode('utf-8'), destinationId=destination_id, wantAck=True, portNum=portnums_pb2.TEXT_MESSAGE_APP)
                     else:
                         raise e
+            except Exception as e:
+                error_msg = str(e)
+                if "too big" in error_msg.lower() or "payload" in error_msg.lower():
+                    print(f"[ERROR] Failed to send private message: {error_msg}")
+                    print(f"  Message size: {message_size} bytes (raw text: {len(text.encode('utf-8'))} bytes)")
+                    print(f"  Encrypted: {is_encrypted}")
+                else:
+                    print(f"[ERROR] Failed to send private message: {error_msg}")
+                return False
             
             return True
         except Exception as e:
-            print(f"[ERROR] Failed to send private message: {e}")
+            error_msg = str(e)
+            if "too big" in error_msg.lower() or "payload" in error_msg.lower():
+                message_size = len(message_to_send.encode('utf-8')) if 'message_to_send' in locals() else 0
+                print(f"[ERROR] Failed to send private message: {error_msg}")
+                print(f"  Message size: {message_size} bytes (raw text: {len(text.encode('utf-8'))} bytes)")
+                print(f"  Encrypted: {is_encrypted if 'is_encrypted' in locals() else 'unknown'}")
+            else:
+                print(f"[ERROR] Failed to send private message: {error_msg}")
             return False
     
     def send_message(self, text: str, destination_id: Optional[int] = None, skip_confirmation: bool = False) -> bool:
@@ -767,10 +794,10 @@ class MeshasticClient:
             node_identifier: Node ID (number) or exact node name (long name or short name)
             text: Message text to send
         """
-        # First, try to parse as a node ID (number)
+        # Resolve node identifier to node ID
+        destination_id = None
         try:
             destination_id = int(node_identifier)
-            return self.send_message(text, destination_id=destination_id)
         except ValueError:
             # Not a number, try to resolve as exact name match
             pass
@@ -887,7 +914,7 @@ class MeshasticClient:
             print(f"[ERROR] Could not resolve node: {node_identifier}")
             return False
         
-        # Read and encode file
+        # Read file
         try:
             with open(file_path, 'rb') as f:
                 file_data = f.read()
@@ -895,59 +922,76 @@ class MeshasticClient:
             print(f"[ERROR] Failed to read file: {e}")
             return False
         
-        # Encode to base64
-        file_base64 = base64.b64encode(file_data).decode('utf-8')
         filename = os.path.basename(file_path)
         
         # Calculate file hash for verification (use first 16 chars of hash to save space)
         file_hash_full = hashlib.sha256(file_data).hexdigest()
         file_hash = file_hash_full[:16]  # Use first 16 chars for header, verify full hash on reassembly
         
-        # Split into chunks (max 100 bytes per chunk to leave room for metadata and encryption)
+        # Encrypt the entire file first (if encryption is enabled)
+        my_node_id = self.get_my_node_id()
+        if my_node_id is None:
+            print("[ERROR] Cannot get our node ID for encryption")
+            return False
+        
+        key = self.get_encryption_key(str(my_node_id))
+        if key is None:
+            print("[WARN] No encryption key set for our node, sending file unencrypted")
+            encrypted_data = file_data
+            is_encrypted = False
+        else:
+            try:
+                from cryptography.fernet import Fernet
+                fernet = Fernet(key)
+                encrypted_data = fernet.encrypt(file_data)
+                is_encrypted = True
+            except Exception as e:
+                print(f"[ERROR] Failed to encrypt file: {e}")
+                return False
+        
+        # Base64 encode the encrypted data
+        encrypted_base64 = base64.b64encode(encrypted_data).decode('utf-8')
+        
+        # Split encrypted data into chunks (stable chunk size - no encryption overhead per chunk)
         # Meshtastic messages have a limit around 240 bytes
-        # We need to account for:
-        # - FILECHUNK metadata: ~27 bytes ([FILECHUNK:file_id:chunk_num:total_chunks:])
-        # - [ENCRYPTED] prefix: 11 bytes
-        # - Base64 encoding overhead from encryption: ~33% increase
-        # - Base64 encoding of chunk data itself
-        # So 100 bytes of base64 data + metadata + encryption overhead should fit safely
-        chunk_size = 100
-        total_chunks = (len(file_base64) + chunk_size - 1) // chunk_size
+        # We need room for: [FILECHUNK:file_id:chunk_num:total_chunks:data]
+        # Metadata is ~30-40 bytes, so we can use ~200 bytes for data
+        chunk_size = 200
+        total_chunks = (len(encrypted_base64) + chunk_size - 1) // chunk_size
         
         # Generate unique file ID (short)
         file_id = str(uuid.uuid4())[:8]
         
         print(f"[INFO] Sending file '{filename}' ({file_size} bytes, {total_chunks} chunks) to node {destination_id}...")
         
-        # Send file header (keep it short - use base64 filename if needed)
-        # Format: [FILE:file_id:filename:total_chunks:hash16]
+        # Send file header (keep it short)
+        # Format: [FILE:file_id:filename:total_chunks:hash16:encrypted]
         # Truncate filename if too long (max 50 chars)
         safe_filename = filename[:50] if len(filename) <= 50 else filename[:47] + "..."
-        header = f"[FILE:{file_id}:{safe_filename}:{total_chunks}:{file_hash}]"
+        is_encrypted_flag = "1" if is_encrypted else "0"
+        header = f"[FILE:{file_id}:{safe_filename}:{total_chunks}:{file_hash}:{is_encrypted_flag}]"
         if not self._send_encrypted_private_message(header, destination_id):
             print("[ERROR] Failed to send file header")
             return False
         
-        # Send chunks
+        # Send chunks (no encryption needed - data is already encrypted)
         for chunk_num in range(total_chunks):
             start = chunk_num * chunk_size
             end = start + chunk_size
-            chunk_data = file_base64[start:end]
+            chunk_data = encrypted_base64[start:end]
             
-            # Send chunk with metadata (keep metadata minimal)
+            # Send chunk with metadata (no encryption - data is already encrypted)
             # Format: [FILECHUNK:file_id:chunk_num:total_chunks:data]
             chunk_message = f"[FILECHUNK:{file_id}:{chunk_num}:{total_chunks}:{chunk_data}]"
             
-            # Check message size before encryption (Meshtastic limit is around 240 bytes after encryption)
-            # The message will be encrypted, which adds [ENCRYPTED] prefix and base64 encoding overhead
-            # So we need to keep the raw message smaller - aim for ~180 bytes max before encryption
-            raw_message_size = len(chunk_message.encode('utf-8'))
-            if raw_message_size > 180:
-                # Chunk too large even before encryption
-                print(f"[ERROR] Chunk {chunk_num + 1} too large ({raw_message_size} bytes before encryption)")
+            # Check message size (should be well under 240 bytes now)
+            message_size = len(chunk_message.encode('utf-8'))
+            if message_size > 240:
+                print(f"[ERROR] Chunk {chunk_num + 1} too large ({message_size} bytes)")
                 return False
             
-            if not self._send_encrypted_private_message(chunk_message, destination_id):
+            # Send as regular private message (no additional encryption)
+            if not self.send_message(chunk_message, destination_id=destination_id):
                 print(f"[ERROR] Failed to send chunk {chunk_num + 1}/{total_chunks}")
                 return False
             
@@ -980,8 +1024,22 @@ class MeshasticClient:
                     second_last_colon_idx = content.rfind(':')
                     if second_last_colon_idx == -1:
                         return False
+                    # Check if there's an encryption flag (new format) or just total_chunks (old format)
+                    encryption_flag = None
                     try:
-                        total_chunks = int(content[second_last_colon_idx+1:])
+                        # Try to parse as encryption flag first
+                        potential_flag = content[second_last_colon_idx+1:]
+                        if potential_flag in ['0', '1']:
+                            # This is the encryption flag, get total_chunks from previous colon
+                            encryption_flag = potential_flag
+                            content = content[:second_last_colon_idx]
+                            second_last_colon_idx = content.rfind(':')
+                            if second_last_colon_idx == -1:
+                                return False
+                            total_chunks = int(content[second_last_colon_idx+1:])
+                        else:
+                            # Old format, no encryption flag
+                            total_chunks = int(potential_flag)
                     except ValueError:
                         return False
                     content = content[:second_last_colon_idx]
@@ -993,6 +1051,9 @@ class MeshasticClient:
                     filename = content[first_colon_idx+1:]
                     
                     if file_id and filename and total_chunks > 0 and file_hash:
+                        # Parse encryption flag (optional, for backwards compatibility)
+                        is_encrypted = encryption_flag == "1" if encryption_flag is not None else False
+                        
                         # Initialize file transfer
                         # Store partial hash (16 chars) for now, will verify with full hash on reassembly
                         self.file_transfers[file_id] = {
@@ -1002,6 +1063,7 @@ class MeshasticClient:
                             'from_id': from_id,
                             'from_name': from_name,
                             'file_hash_partial': file_hash,  # Store partial hash from header
+                            'is_encrypted': is_encrypted,  # Whether the file data is encrypted
                             'timestamp': datetime.now().isoformat()
                         }
                         
@@ -1043,6 +1105,150 @@ class MeshasticClient:
                 return False
         
         return False
+    
+    def _handle_message_chunk(self, text: str, from_id: str, from_name: str) -> bool:
+        """Handle incoming long message chunk or header
+        
+        Returns:
+            True if this was a message chunk (handled), False otherwise
+        """
+        # Check for message header
+        if text.startswith("[MSG:"):
+            try:
+                # Parse: [MSG:message_id:total_chunks:encrypted]
+                if text.endswith(']'):
+                    content = text[5:-1]  # Remove [MSG: and ]
+                    parts = content.split(':')
+                    if len(parts) >= 3:
+                        message_id = parts[0]
+                        total_chunks = int(parts[1])
+                        is_encrypted = parts[2] == "1"
+                        
+                        # Initialize message transfer
+                        self.message_transfers[message_id] = {
+                            'total_chunks': total_chunks,
+                            'received_chunks': {},
+                            'from_id': from_id,
+                            'from_name': from_name,
+                            'is_encrypted': is_encrypted,
+                            'timestamp': datetime.now().isoformat()
+                        }
+                        
+                        print(f"\n[MSG] Receiving long message from {from_name} ({from_id}) - {total_chunks} chunks")
+                        return True
+            except Exception as e:
+                print(f"[ERROR] Failed to parse message header: {e}")
+                return False
+        
+        # Check for message chunk
+        elif text.startswith("[MSGCHUNK:"):
+            try:
+                # Parse: [MSGCHUNK:message_id:chunk_num:total_chunks:data]
+                parts = text[10:-1].split(':')  # Remove [MSGCHUNK: and ]
+                if len(parts) >= 4:
+                    message_id = parts[0]
+                    chunk_num = int(parts[1])
+                    total_chunks = int(parts[2])
+                    chunk_data = ':'.join(parts[3:])  # Rejoin in case data contains ':'
+                    
+                    # Check if we have this message transfer
+                    if message_id not in self.message_transfers:
+                        print(f"[WARN] Received chunk for unknown message: {message_id}")
+                        return True  # Still handled, just ignored
+                    
+                    transfer = self.message_transfers[message_id]
+                    
+                    # Store chunk
+                    transfer['received_chunks'][chunk_num] = chunk_data
+                    
+                    # Check if all chunks received
+                    if len(transfer['received_chunks']) == transfer['total_chunks']:
+                        # Reassemble message
+                        self._reassemble_message(message_id)
+                    
+                    return True
+            except Exception as e:
+                print(f"[ERROR] Failed to parse message chunk: {e}")
+                return False
+        
+        return False
+    
+    def _reassemble_message(self, message_id: str):
+        """Reassemble a long message from received chunks"""
+        if message_id not in self.message_transfers:
+            return
+        
+        transfer = self.message_transfers[message_id]
+        total_chunks = transfer['total_chunks']
+        received_chunks = transfer['received_chunks']
+        is_encrypted = transfer.get('is_encrypted', False)
+        from_id = transfer['from_id']
+        from_name = transfer['from_name']
+        
+        # Check if we have all chunks
+        if len(received_chunks) != total_chunks:
+            print(f"[ERROR] Missing chunks for message: {len(received_chunks)}/{total_chunks}")
+            return
+        
+        # Reassemble base64 string (this is the encrypted data)
+        chunks = []
+        for i in range(total_chunks):
+            if i not in received_chunks:
+                print(f"[ERROR] Missing chunk {i} for message")
+                del self.message_transfers[message_id]
+                return
+            chunks.append(received_chunks[i])
+        
+        encrypted_base64 = ''.join(chunks)
+        
+        # Decode from base64 to get encrypted data
+        try:
+            encrypted_data = base64.b64decode(encrypted_base64)
+        except Exception as e:
+            print(f"[ERROR] Failed to decode encrypted message data: {e}")
+            del self.message_transfers[message_id]
+            return
+        
+        # Decrypt if needed
+        if is_encrypted:
+            # Get sender's key for decryption
+            key = self.get_encryption_key(str(from_id))
+            if key is None:
+                print(f"[ERROR] No encryption key available for node {from_id} to decrypt message")
+                del self.message_transfers[message_id]
+                return
+            
+            try:
+                from cryptography.fernet import Fernet
+                fernet = Fernet(key)
+                message_data = fernet.decrypt(encrypted_data)
+                message_text = message_data.decode('utf-8')
+            except Exception as e:
+                print(f"[ERROR] Failed to decrypt message data: {e}")
+                del self.message_transfers[message_id]
+                return
+        else:
+            message_text = encrypted_data.decode('utf-8')
+        
+        # Display the reassembled message
+        timestamp = datetime.now().isoformat()
+        enc_indicator = " [ENCRYPTED]" if is_encrypted else ""
+        print(f"\n[{timestamp}] {from_name} ({from_id}){enc_indicator}: {message_text}")
+        
+        # Add to history
+        message = {
+            'timestamp': timestamp,
+            'from_id': str(from_id),
+            'from_name': from_name,
+            'text': message_text,
+            'encrypted': is_encrypted
+        }
+        self.add_to_history(message)
+        
+        print("> ", end='', flush=True)
+        
+        # Clean up
+        del self.message_transfers[message_id]
     
     def _reassemble_file(self, file_id: str):
         """Reassemble a file from received chunks"""
