@@ -1130,79 +1130,79 @@ class MeshasticClient:
                     print(f"[DEBUG] File header doesn't end with ]: {text!r}")
                     return False
                 content = text[6:-1]  # Remove [FILE: and ]
-                    # Find the last 3 colons (for total_chunks, file_hash, and end)
-                    last_colon_idx = content.rfind(':')
-                    if last_colon_idx == -1:
-                        return False
-                    file_hash = content[last_colon_idx+1:]
-                    content = content[:last_colon_idx]
-                    
-                    second_last_colon_idx = content.rfind(':')
-                    if second_last_colon_idx == -1:
-                        return False
-                    # Check if there's an encryption flag (new format) or just total_chunks (old format)
-                    encryption_flag = None
-                    try:
-                        # Try to parse as encryption flag first
-                        potential_flag = content[second_last_colon_idx+1:]
-                        if potential_flag in ['0', '1']:
-                            # This is the encryption flag, get total_chunks from previous colon
-                            encryption_flag = potential_flag
-                            content = content[:second_last_colon_idx]
-                            second_last_colon_idx = content.rfind(':')
-                            if second_last_colon_idx == -1:
-                                return False
-                            total_chunks = int(content[second_last_colon_idx+1:])
-                        else:
-                            # Old format, no encryption flag
-                            total_chunks = int(potential_flag)
-                    except ValueError:
-                        return False
-                    content = content[:second_last_colon_idx]
-                    
-                    first_colon_idx = content.find(':')
-                    if first_colon_idx == -1:
-                        return False
-                    file_id = content[:first_colon_idx]
-                    filename = content[first_colon_idx+1:]
-                    
-                    if file_id and filename and total_chunks > 0 and file_hash:
-                        # Parse encryption flag (optional, for backwards compatibility)
-                        is_encrypted = encryption_flag == "1" if encryption_flag is not None else False
-                        
-                        # Initialize file transfer
-                        # Store partial hash (16 chars) for now, will verify with full hash on reassembly
-                        self.file_transfers[file_id] = {
-                            'filename': filename,
-                            'total_chunks': total_chunks,
-                            'received_chunks': {},
-                            'from_id': from_id,
-                            'from_name': from_name,
-                            'file_hash_partial': file_hash,  # Store partial hash from header
-                            'is_encrypted': is_encrypted,  # Whether the file data is encrypted
-                            'timestamp': datetime.now().isoformat()
-                        }
-                        
-                        # Check if we have orphaned chunks for this file_id
-                        if file_id in self.orphaned_chunks:
-                            orphaned = self.orphaned_chunks[file_id]
-                            print(f"\n[FILE] Receiving file '{filename}' from {from_name} ({from_id}) - {total_chunks} chunks")
-                            if orphaned:
-                                print(f"[INFO] Found {len(orphaned)} orphaned chunks, applying them...")
-                                for orphan in orphaned:
-                                    if orphan['chunk_num'] < total_chunks:
-                                        self.file_transfers[file_id]['received_chunks'][orphan['chunk_num']] = orphan['chunk_data']
-                                # Check if we now have all chunks
-                                if len(self.file_transfers[file_id]['received_chunks']) == total_chunks:
-                                    self._reassemble_file(file_id)
-                            del self.orphaned_chunks[file_id]
-                        else:
-                            print(f"\n[FILE] Receiving file '{filename}' from {from_name} ({from_id}) - {total_chunks} chunks")
-                        return True
+                # Find the last 3 colons (for total_chunks, file_hash, and end)
+                last_colon_idx = content.rfind(':')
+                if last_colon_idx == -1:
+                    return False
+                file_hash = content[last_colon_idx+1:]
+                content = content[:last_colon_idx]
+                
+                second_last_colon_idx = content.rfind(':')
+                if second_last_colon_idx == -1:
+                    return False
+                # Check if there's an encryption flag (new format) or just total_chunks (old format)
+                encryption_flag = None
+                try:
+                    # Try to parse as encryption flag first
+                    potential_flag = content[second_last_colon_idx+1:]
+                    if potential_flag in ['0', '1']:
+                        # This is the encryption flag, get total_chunks from previous colon
+                        encryption_flag = potential_flag
+                        content = content[:second_last_colon_idx]
+                        second_last_colon_idx = content.rfind(':')
+                        if second_last_colon_idx == -1:
+                            return False
+                        total_chunks = int(content[second_last_colon_idx+1:])
                     else:
-                        # Parsing succeeded but required fields are missing - this shouldn't happen
-                        print(f"[DEBUG] File header parsing incomplete: file_id={file_id!r}, filename={filename!r}, total_chunks={total_chunks}, file_hash={file_hash!r}")
-                        return False
+                        # Old format, no encryption flag
+                        total_chunks = int(potential_flag)
+                except ValueError:
+                    return False
+                content = content[:second_last_colon_idx]
+                
+                first_colon_idx = content.find(':')
+                if first_colon_idx == -1:
+                    return False
+                file_id = content[:first_colon_idx]
+                filename = content[first_colon_idx+1:]
+                
+                if file_id and filename and total_chunks > 0 and file_hash:
+                    # Parse encryption flag (optional, for backwards compatibility)
+                    is_encrypted = encryption_flag == "1" if encryption_flag is not None else False
+                    
+                    # Initialize file transfer
+                    # Store partial hash (16 chars) for now, will verify with full hash on reassembly
+                    self.file_transfers[file_id] = {
+                        'filename': filename,
+                        'total_chunks': total_chunks,
+                        'received_chunks': {},
+                        'from_id': from_id,
+                        'from_name': from_name,
+                        'file_hash_partial': file_hash,  # Store partial hash from header
+                        'is_encrypted': is_encrypted,  # Whether the file data is encrypted
+                        'timestamp': datetime.now().isoformat()
+                    }
+                    
+                    # Check if we have orphaned chunks for this file_id
+                    if file_id in self.orphaned_chunks:
+                        orphaned = self.orphaned_chunks[file_id]
+                        print(f"\n[FILE] Receiving file '{filename}' from {from_name} ({from_id}) - {total_chunks} chunks")
+                        if orphaned:
+                            print(f"[INFO] Found {len(orphaned)} orphaned chunks, applying them...")
+                            for orphan in orphaned:
+                                if orphan['chunk_num'] < total_chunks:
+                                    self.file_transfers[file_id]['received_chunks'][orphan['chunk_num']] = orphan['chunk_data']
+                            # Check if we now have all chunks
+                            if len(self.file_transfers[file_id]['received_chunks']) == total_chunks:
+                                self._reassemble_file(file_id)
+                        del self.orphaned_chunks[file_id]
+                    else:
+                        print(f"\n[FILE] Receiving file '{filename}' from {from_name} ({from_id}) - {total_chunks} chunks")
+                    return True
+                else:
+                    # Parsing succeeded but required fields are missing - this shouldn't happen
+                    print(f"[DEBUG] File header parsing incomplete: file_id={file_id!r}, filename={filename!r}, total_chunks={total_chunks}, file_hash={file_hash!r}")
+                    return False
             except Exception as e:
                 print(f"[ERROR] Failed to parse file header: {e}")
                 import traceback
